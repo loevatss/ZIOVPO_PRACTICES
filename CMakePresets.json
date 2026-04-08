@@ -1,0 +1,26 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "vs2022-release",
+      "displayName": "VS2022 Release v143",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/vs2022-release",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "toolset": {
+        "value": "v143",
+        "strategy": "external"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-release",
+      "configurePreset": "vs2022-release",
+      "configuration": "Release"
+    }
+  ]
+}

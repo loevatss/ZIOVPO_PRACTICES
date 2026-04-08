@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Antivirus/Antivirus.vcxproj" Id="0078582c-befb-446b-ac51-a77a2d7c69c0" />
+</Solution>
