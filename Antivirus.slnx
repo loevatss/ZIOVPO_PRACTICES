@@ -5,4 +5,5 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="Antivirus/Antivirus.vcxproj" Id="0078582c-befb-446b-ac51-a77a2d7c69c0" />
+  <Project Path="AntivirusService/AntivirusService.vcxproj" Id="5ba3cd58-32ca-4e62-b14e-9405b1645488" />
 </Solution>

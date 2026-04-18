@@ -1,0 +1,13 @@
+import "rpc.idl";
+import "rpcndr.idl";
+
+[
+    uuid(5db3f336-cfb3-46da-925e-4e7fbad8d53a),
+    version(1.0),
+    pointer_default(unique),
+    implicit_handle(handle_t AntivirusRpcControlBinding)
+]
+interface AntivirusRpcControl
+{
+    void StopService(void);
+}

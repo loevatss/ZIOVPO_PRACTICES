@@ -1,0 +1,7 @@
+[
+    uuid(6523b198-c01f-449f-90b9-79bfc6d9cbc7),
+    version(1.0)
+]
+interface rpcndr
+{
+}

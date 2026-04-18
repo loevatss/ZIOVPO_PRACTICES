@@ -6,24 +6,41 @@ on:
 
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure CMake
-        run: cmake --preset vs2022-release
+      - name: Configure CMake (VS2022, v143, x64)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -T v143
 
-      - name: Build
-        run: cmake --build --preset build-release
+      - name: Build Release
+        run: cmake --build build --config Release
 
-      - name: Prepare artifact
+      - name: Collect executables
         shell: pwsh
-        run: New-Item -ItemType Directory -Path artifacts -Force | Out-Null; Copy-Item build/vs2022-release/Release/Antivirus.exe artifacts/Antivirus.exe
+        run: |
+          $antivirusExe = "build/Release/Antivirus.exe"
+          $serviceExe = "build/Release/AntivirusService.exe"
 
-      - name: Upload artifact
+          if (-not (Test-Path $antivirusExe)) {
+            throw "Antivirus.exe was not found at $antivirusExe"
+          }
+          if (-not (Test-Path $serviceExe)) {
+            throw "AntivirusService.exe was not found at $serviceExe"
+          }
+
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          Copy-Item -Path $antivirusExe -Destination artifacts/Antivirus.exe -Force
+          Copy-Item -Path $serviceExe -Destination artifacts/AntivirusService.exe -Force
+
+          Write-Host "Antivirus: $antivirusExe"
+          Write-Host "AntivirusService: $serviceExe"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Antivirus-exe
-          path: artifacts/Antivirus.exe
+          name: antivirus-release-x64
+          path: artifacts/*.exe
+          if-no-files-found: error
