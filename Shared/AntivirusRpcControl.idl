@@ -9,5 +9,62 @@ import "rpcndr.idl";
 ]
 interface AntivirusRpcControl
 {
+    typedef [v1_enum] enum RpcResultCode
+    {
+        RPC_RESULT_OK = 0,
+        RPC_RESULT_INVALID_ARGUMENT = 1,
+        RPC_RESULT_AUTH_FAILED = 2,
+        RPC_RESULT_NOT_AUTHENTICATED = 3,
+        RPC_RESULT_NETWORK_ERROR = 4,
+        RPC_RESULT_NO_LICENSE = 5,
+        RPC_RESULT_LICENSE_EXPIRED = 6,
+        RPC_RESULT_LICENSE_BLOCKED = 7,
+        RPC_RESULT_INTERNAL_ERROR = 8
+    } RpcResultCode;
+
+    typedef struct RpcAuthInfo
+    {
+        long authenticated;
+        long hasUserId;
+        hyper userId;
+        wchar_t username[128];
+    } RpcAuthInfo;
+
+    typedef struct RpcLicenseInfo
+    {
+        long hasLicense;
+        long blocked;
+        long errorCode;
+        wchar_t expirationDate[64];
+        wchar_t error[128];
+    } RpcLicenseInfo;
+
+    // Останавливает службу через существующий RPC.
     void StopService(void);
+
+    // Возвращает безопасную информацию о текущем пользователе.
+    RpcResultCode GetCurrentAuthInfo([out] RpcAuthInfo* authInfo);
+
+    // Выполняет login и сохраняет токены только в памяти службы.
+    RpcResultCode LoginUser(
+        [in, string] const wchar_t* username,
+        [in, string] const wchar_t* password,
+        [out] RpcAuthInfo* authInfo);
+
+    // Выполняет logout и очищает auth/license состояние в памяти.
+    RpcResultCode LogoutUser([out] RpcAuthInfo* authInfo, [out] RpcLicenseInfo* licenseInfo);
+
+    // Запрашивает и возвращает безопасное состояние лицензии.
+    RpcResultCode GetActiveLicenseInfo(
+        [in] hyper productId,
+        [in, string] const wchar_t* deviceMac,
+        [out] RpcLicenseInfo* licenseInfo);
+
+    // Активирует продукт и возвращает безопасное состояние лицензии.
+    RpcResultCode ActivateProduct(
+        [in, string] const wchar_t* activationKey,
+        [in, string] const wchar_t* deviceName,
+        [in, string] const wchar_t* deviceMac,
+        [in] hyper productId,
+        [out] RpcLicenseInfo* licenseInfo);
 }
