@@ -1,0 +1,7 @@
+[
+    uuid(5df4f1c4-a6c7-40fc-a4ca-0ea45e31a6cc),
+    version(1.0)
+]
+interface rpc
+{
+}
