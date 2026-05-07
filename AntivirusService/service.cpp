@@ -17,7 +17,9 @@
 #include <vector>
 
 #include "AntivirusRpcControl.h"
+#include "ProcessProtection.h"
 #include "ServiceCommon.h"
+#include "ServiceProtection.h"
 #include "WebApiIntegration.h"
 
 namespace
@@ -33,6 +35,8 @@ SERVICE_STATUS g_serviceStatus{};
 volatile LONG g_rpcStopRequested = 0;
 constexpr DWORD kServiceStartTimeoutMs = 30000;
 constexpr DWORD kServiceStatusPollIntervalMs = 250;
+constexpr bool kDenyAdministratorsProcessTerminate = true;
+constexpr bool kDenyAdministratorsServiceStop = true;
 
 std::mutex g_guiProcessesMutex;
 std::unordered_map<DWORD, GuiProcessInfo> g_guiProcessesBySession;
@@ -476,6 +480,32 @@ void ShutdownWebApiLayer()
 DWORD RpcStatusToWin32(RPC_STATUS status)
 {
     return status == RPC_S_OK ? NO_ERROR : static_cast<DWORD>(status);
+}
+
+// Пишет диагностическое сообщение службы в OutputDebugStringW.
+void DebugLogServiceProtection(const wchar_t* message)
+{
+    wchar_t buffer[256]{};
+    swprintf_s(buffer, L"[AntivirusService] %ls\r\n", message);
+    OutputDebugStringW(buffer);
+}
+
+// Применяет user-mode защиту к process object службы и к service object.
+void HardenRunningServiceObjects()
+{
+    antivirus::protection::ProcessProtectionPolicy processPolicy{};
+    processPolicy.denyBuiltinAdministratorsTerminate = kDenyAdministratorsProcessTerminate;
+    if (!antivirus::protection::HardenCurrentProcess(processPolicy))
+    {
+        DebugLogServiceProtection(L"service process hardening failed; service keeps running");
+    }
+
+    antivirus::protection::ServiceProtectionPolicy servicePolicy{};
+    servicePolicy.denyBuiltinAdministratorsStop = kDenyAdministratorsServiceStop;
+    if (!antivirus::protection::HardenServiceObject(antivirus::common::kServiceName, servicePolicy))
+    {
+        DebugLogServiceProtection(L"service object hardening failed; service keeps running");
+    }
 }
 
 void ReportServiceStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint)
@@ -948,6 +978,20 @@ bool LaunchGuiInSession(DWORD sessionId)
 
     CloseHandle(processInfo.hThread);
 
+    antivirus::protection::ProcessProtectionPolicy guiProtectionPolicy{};
+    guiProtectionPolicy.denyBuiltinAdministratorsTerminate = kDenyAdministratorsProcessTerminate;
+    if (!antivirus::protection::HardenProcessHandle(
+        processInfo.hProcess,
+        processInfo.dwProcessId,
+        guiProtectionPolicy))
+    {
+        DebugLogServiceProtection(L"GUI process hardening failed; terminating only the GUI process");
+        TerminateProcess(processInfo.hProcess, 0);
+        WaitForSingleObject(processInfo.hProcess, 5000);
+        CloseHandle(processInfo.hProcess);
+        return false;
+    }
+
     if (!TrackGuiProcess(sessionId, processInfo.dwProcessId, processInfo.hProcess))
     {
         TerminateProcess(processInfo.hProcess, 0);
@@ -1107,6 +1151,7 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
     }
 
     ReportServiceStatus(SERVICE_RUNNING, NO_ERROR, 0);
+    HardenRunningServiceObjects();
     LaunchGuiInAllUserSessions();
 
     RPC_STATUS waitStatus = RpcMgmtWaitServerListen();
@@ -1124,14 +1169,27 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
 }
 } // namespace
 
-extern "C" void StopService(void)
+// Запрашивает штатную остановку RPC listener и service main loop.
+void RequestConfirmedServiceStop()
 {
     if (InterlockedExchange(&g_rpcStopRequested, 1) != 0)
     {
         return;
     }
 
+    ReportServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
     RpcMgmtStopServerListening(nullptr);
+}
+
+extern "C" void StopService(void)
+{
+    DebugLogServiceProtection(L"legacy StopService RPC ignored; use ConfirmStop after GUI confirmation");
+}
+
+// Останавливает службу после подтверждения в пользовательской GUI session.
+extern "C" void ConfirmStop(void)
+{
+    RequestConfirmedServiceStop();
 }
 
 // Returns safe information about the current authenticated user.

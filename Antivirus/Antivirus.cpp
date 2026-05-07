@@ -19,6 +19,7 @@
 
 #include "AntivirusRpcControl.h"
 #include "ServiceCommon.h"
+#include "UserIsolatedStopConfirmation.h"
 
 #pragma comment(lib, "Iphlpapi.lib")
 
@@ -114,7 +115,7 @@ bool TryGetProcessBaseName(DWORD processId, std::wstring& baseName);
 bool QueryServiceStatusProcess(SC_HANDLE serviceHandle, SERVICE_STATUS_PROCESS& status);
 bool IsServiceLaunchArgumentPresent(LPCWSTR commandLine);
 bool ShouldContinueGuiStartup(LPCWSTR commandLine);
-bool RequestServiceStopViaRpc();
+bool RequestConfirmedServiceStopViaRpc();
 bool EnsureRpcBinding();
 void ReleaseRpcBinding();
 bool QueryCurrentAuthInfo(RpcAuthInfo& authInfo);
@@ -536,8 +537,8 @@ bool ShouldContinueGuiStartup(LPCWSTR commandLine)
     return IsServiceLaunchArgumentPresent(commandLine);
 }
 
-// Requests service stop through RPC.
-bool RequestServiceStopViaRpc()
+// Requests service stop through confirmed RPC endpoint.
+bool RequestConfirmedServiceStopViaRpc()
 {
     if (!EnsureRpcBinding())
     {
@@ -547,7 +548,7 @@ bool RequestServiceStopViaRpc()
     bool rpcCallSucceeded = true;
     RpcTryExcept
     {
-        StopService();
+        ConfirmStop();
     }
     RpcExcept(EXCEPTION_EXECUTE_HANDLER)
     {
@@ -1366,7 +1367,24 @@ void HandleAntivirusAction(HWND hWnd)
 
 void RequestServiceStopAndExit(HWND hWnd)
 {
-    if (!RequestServiceStopViaRpc())
+    const antivirus::ui::StopConfirmationResult confirmationResult =
+        antivirus::ui::ShowIsolatedStopConfirmation();
+    if (confirmationResult == antivirus::ui::StopConfirmationResult::Rejected)
+    {
+        return;
+    }
+
+    if (confirmationResult != antivirus::ui::StopConfirmationResult::Confirmed)
+    {
+        MessageBoxW(
+            hWnd,
+            L"Failed to show stop confirmation.",
+            L"Antivirus",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    if (!RequestConfirmedServiceStopViaRpc())
     {
         MessageBoxW(
             hWnd,

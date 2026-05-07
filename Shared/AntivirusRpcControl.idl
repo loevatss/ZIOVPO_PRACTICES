@@ -40,7 +40,11 @@ interface AntivirusRpcControl
     } RpcLicenseInfo;
 
     // Останавливает службу через существующий RPC.
+    // Legacy endpoint: kept for ABI compatibility, service ignores it.
     void StopService(void);
+
+    // Останавливает службу после подтверждения в пользовательской GUI session.
+    void ConfirmStop(void);
 
     // Возвращает безопасную информацию о текущем пользователе.
     RpcResultCode GetCurrentAuthInfo([out] RpcAuthInfo* authInfo);
