@@ -1,0 +1,48 @@
+# =========================
+# Visual Studio
+# =========================
+.vs/
+*.vcxproj.user
+*.vcxproj.filters
+*.suo
+*.user
+
+# =========================
+# Build directories
+# =========================
+build/
+Debug/
+Release/
+x64/
+x86/
+ARM/
+ARM64/
+
+# =========================
+# CMake
+# =========================
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+
+# =========================
+# Intermediate / temp files
+# =========================
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.log
+*.tmp
+*.cache
+
+# =========================
+# Windows junk
+# =========================
+Thumbs.db
+Desktop.ini
+
+# =========================
+# IDE (optional)
+# =========================
+.vscode/
