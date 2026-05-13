@@ -10,13 +10,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <cwchar>
 #include <cwctype>
+#include <filesystem>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include "AntivirusEngine.h"
+#include "AntivirusEngineSelfTest.h"
+#include "AntivirusScanService.h"
 #include "AntivirusRpcControl.h"
 #include "ProcessProtection.h"
 #include "ServiceCommon.h"
@@ -46,7 +52,11 @@ std::wstring g_guiExecutablePath;
 std::thread g_guiSessionMonitorThread;
 std::atomic<bool> g_guiSessionMonitorStopRequested = false;
 antivirus::web::InMemorySession g_webSession;
-antivirus::web::ApiClient g_webApiClient(L"https://10.11.134.140:8443/");
+// antivirus::web::ApiClient g_webApiClient(L"https://10.11.134.140:8443/");
+antivirus::web::ApiClient g_webApiClient(L"https://192.168.1.56:8443/");
+antivirus::engine::AvSignatureDatabase g_avSignatureDatabase;
+std::mutex g_avDatabaseMutex;
+bool g_avDatabaseLoaded = false;
 std::mutex g_webStateMutex;
 std::thread g_webWorkerThread;
 std::atomic<bool> g_webWorkerStopRequested = false;
@@ -118,6 +128,21 @@ void CopyUtf8ToRpcBuffer(const std::string& source, wchar_t (&target)[BufferSize
 
     const size_t count = std::min(static_cast<size_t>(BufferSize - 1), wide.size());
     std::wmemcpy(target, wide.c_str(), count);
+    target[count] = L'\0';
+}
+
+// Copies UTF-16 text into a fixed RPC wide-char buffer.
+template <size_t BufferSize>
+void CopyWideToRpcBuffer(const std::wstring& source, wchar_t (&target)[BufferSize])
+{
+    static_assert(BufferSize > 0);
+    std::fill(std::begin(target), std::end(target), L'\0');
+
+    const size_t count = std::min(static_cast<size_t>(BufferSize - 1), source.size());
+    if (count > 0)
+    {
+        std::wmemcpy(target, source.c_str(), count);
+    }
     target[count] = L'\0';
 }
 
@@ -272,6 +297,11 @@ RpcResultCode EvaluateLicenseState()
         return RPC_RESULT_LICENSE_BLOCKED;
     }
 
+    if (licenseState.ticket.licenseExpirationDate.empty())
+    {
+        return RPC_RESULT_OK;
+    }
+
     std::chrono::system_clock::time_point expirationTime{};
     if (!TryParseIsoDateTimeUtc(licenseState.ticket.licenseExpirationDate, &expirationTime))
     {
@@ -376,6 +406,104 @@ void FillRpcLicenseInfo(RpcLicenseInfo* licenseInfo, RpcResultCode errorCode, co
     {
         CopyUtf8ToRpcBuffer(errorText, licenseInfo->error);
     }
+}
+
+// Converts service scan status to the RPC status enum.
+RpcScanStatus ToRpcScanStatus(antivirus::service::FileScanStatus status)
+{
+    switch (status)
+    {
+    case antivirus::service::FileScanStatus::Infected:
+        return RPC_SCAN_STATUS_INFECTED;
+    case antivirus::service::FileScanStatus::Error:
+        return RPC_SCAN_STATUS_ERROR;
+    default:
+        return RPC_SCAN_STATUS_CLEAN;
+    }
+}
+
+// Fills one RPC scan result from the service scan model.
+void FillRpcScanFileResult(
+    const antivirus::service::FileScanResult& source,
+    RpcScanFileResult* target)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+
+    target->status = ToRpcScanStatus(source.status);
+    CopyWideToRpcBuffer(source.path.wstring(), target->path);
+    CopyUtf8ToRpcBuffer(antivirus::engine::ToString(source.objectType), target->objectType);
+    CopyUtf8ToRpcBuffer(source.recordId, target->recordId);
+    CopyUtf8ToRpcBuffer(source.message, target->message);
+}
+
+// Fills an RPC file result with an immediate service-side error.
+void FillRpcScanErrorResult(
+    const wchar_t* path,
+    const std::string& message,
+    RpcScanFileResult* target)
+{
+    antivirus::service::FileScanResult result;
+    result.status = antivirus::service::FileScanStatus::Error;
+    result.path = path != nullptr ? std::filesystem::path(path) : std::filesystem::path();
+    result.objectType = antivirus::engine::AvObjectType::Unknown;
+    result.message = message;
+    FillRpcScanFileResult(result, target);
+}
+
+// Fills the RPC directory aggregate and allocates the per-file result array.
+bool FillRpcScanDirectoryResult(
+    const antivirus::service::DirectoryScanResult& source,
+    RpcScanDirectoryResult* target)
+{
+    if (target == nullptr)
+    {
+        return false;
+    }
+
+    target->totalScanned = static_cast<hyper>(source.totalScanned);
+    target->infectedCount = static_cast<hyper>(source.infectedCount);
+    target->errorCount = static_cast<hyper>(source.errorCount);
+    target->resultCount = static_cast<long>(std::min<size_t>(
+        source.results.size(),
+        static_cast<size_t>(std::numeric_limits<long>::max())));
+    target->results = nullptr;
+
+    if (target->resultCount == 0)
+    {
+        return true;
+    }
+
+    const size_t bytesToAllocate = static_cast<size_t>(target->resultCount) * sizeof(RpcScanFileResult);
+    target->results = static_cast<RpcScanFileResult*>(std::malloc(bytesToAllocate));
+    if (target->results == nullptr)
+    {
+        target->resultCount = 0;
+        return false;
+    }
+
+    for (long i = 0; i < target->resultCount; ++i)
+    {
+        FillRpcScanFileResult(source.results[static_cast<size_t>(i)], &target->results[i]);
+    }
+    return true;
+}
+
+// Fills current in-memory antivirus database metadata for RPC callers.
+void FillRpcAvDatabaseInfo(
+    const antivirus::service::AvDatabaseRuntimeInfo& source,
+    RpcAvDatabaseInfo* target)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+
+    target->loaded = source.loaded ? 1 : 0;
+    target->recordCount = static_cast<hyper>(source.databaseInfo.recordCount);
+    CopyUtf8ToRpcBuffer(source.databaseInfo.releaseDateUtc, target->releaseDate);
 }
 
 // Periodically refreshes tokens and license ticket in memory.
@@ -499,7 +627,29 @@ void DebugLogService(const wchar_t* format, ...)
     OutputDebugStringW(buffer);
 }
 
-// Пишет диагностическое сообщение службы в OutputDebugStringW.
+// Loads demo antivirus signatures into the service process memory.
+void InitializeAntivirusEngineLayer()
+{
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    g_avDatabaseLoaded = antivirus::service::LoadServiceAntivirusDatabase(g_avSignatureDatabase);
+
+    const antivirus::engine::AvDatabaseInfo info = g_avSignatureDatabase.GetInfo();
+    const std::wstring releaseDate = ToWide(info.releaseDateUtc);
+    DebugLogService(
+        L"Antivirus database loaded in memory: release=%ls, records=%llu",
+        releaseDate.c_str(),
+        static_cast<unsigned long long>(info.recordCount));
+}
+
+// Clears in-memory antivirus signatures before the service process exits.
+void ShutdownAntivirusEngineLayer()
+{
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    g_avSignatureDatabase.Clear();
+    g_avDatabaseLoaded = false;
+}
+
+// Writes service protection diagnostics through the service logger.
 void DebugLogServiceProtection(const wchar_t* message)
 {
     DebugLogService(L"%ls", message);
@@ -1507,12 +1657,14 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
     }
 
     ReportServiceStatus(SERVICE_START_PENDING, NO_ERROR, 5000);
+    InitializeAntivirusEngineLayer();
     InitializeWebApiLayer();
 
     g_guiExecutablePath = ResolveGuiExecutablePath();
     if (g_guiExecutablePath.empty() || !FileExists(g_guiExecutablePath))
     {
         ShutdownWebApiLayer();
+        ShutdownAntivirusEngineLayer();
         ReportServiceStatus(SERVICE_STOPPED, ERROR_FILE_NOT_FOUND, 0);
         return;
     }
@@ -1521,6 +1673,7 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
     if (rpcStartError != NO_ERROR)
     {
         ShutdownWebApiLayer();
+        ShutdownAntivirusEngineLayer();
         ReportServiceStatus(SERVICE_STOPPED, rpcStartError, 0);
         return;
     }
@@ -1535,6 +1688,7 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
     {
         StopGuiSessionMonitor();
         ShutdownWebApiLayer();
+        ShutdownAntivirusEngineLayer();
         ReportServiceStatus(SERVICE_STOPPED, RpcStatusToWin32(waitStatus), 0);
         return;
     }
@@ -1542,6 +1696,7 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
     StopGuiSessionMonitor();
     StopTrackedGuiProcesses();
     ShutdownWebApiLayer();
+    ShutdownAntivirusEngineLayer();
     RpcServerUnregisterIf(AntivirusRpcControl_v1_0_s_ifspec, nullptr, FALSE);
     ReportServiceStatus(SERVICE_STOPPED, NO_ERROR, 0);
 }
@@ -1701,6 +1856,11 @@ extern "C" RpcResultCode GetActiveLicenseInfo(
     }
 
     const RpcResultCode licenseCode = EnsureValidLicenseForAntivirus();
+    if (licenseCode == RPC_RESULT_OK)
+    {
+        InitializeAntivirusEngineLayer();
+    }
+
     FillRpcLicenseInfo(licenseInfo, licenseCode, LicenseCodeToText(licenseCode));
     return licenseCode;
 }
@@ -1786,6 +1946,82 @@ extern "C" RpcResultCode ActivateProduct(
     return licenseCode;
 }
 
+// Scans one selected file through the in-memory antivirus engine.
+extern "C" RpcResultCode ScanFile(
+    const wchar_t* path,
+    RpcScanFileResult* scanResult)
+{
+    if (scanResult == nullptr || path == nullptr || *path == L'\0')
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    *scanResult = RpcScanFileResult{};
+
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    if (!g_avDatabaseLoaded)
+    {
+        FillRpcScanErrorResult(path, "Antivirus database is not loaded", scanResult);
+        return RPC_RESULT_OK;
+    }
+
+    const antivirus::service::FileScanResult result =
+        antivirus::service::ScanFilePath(std::filesystem::path(path), g_avSignatureDatabase);
+    FillRpcScanFileResult(result, scanResult);
+    return RPC_RESULT_OK;
+}
+
+// Scans files in a selected directory recursively through the antivirus engine.
+extern "C" RpcResultCode ScanDirectory(
+    const wchar_t* path,
+    RpcScanDirectoryResult* scanResult)
+{
+    if (scanResult == nullptr || path == nullptr || *path == L'\0')
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    *scanResult = RpcScanDirectoryResult{};
+
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    antivirus::service::DirectoryScanResult result;
+    if (!g_avDatabaseLoaded)
+    {
+        antivirus::service::FileScanResult fileResult;
+        fileResult.status = antivirus::service::FileScanStatus::Error;
+        fileResult.path = std::filesystem::path(path);
+        fileResult.objectType = antivirus::engine::AvObjectType::Unknown;
+        fileResult.message = "Antivirus database is not loaded";
+        result.totalScanned = 1;
+        result.errorCount = 1;
+        result.results.push_back(std::move(fileResult));
+    }
+    else
+    {
+        result = antivirus::service::ScanDirectoryPath(std::filesystem::path(path), g_avSignatureDatabase);
+    }
+
+    return FillRpcScanDirectoryResult(result, scanResult)
+        ? RPC_RESULT_OK
+        : RPC_RESULT_INTERNAL_ERROR;
+}
+
+// Returns current in-memory antivirus database release date and record count.
+extern "C" RpcResultCode GetAvDatabaseInfo(RpcAvDatabaseInfo* databaseInfo)
+{
+    if (databaseInfo == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    *databaseInfo = RpcAvDatabaseInfo{};
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    const antivirus::service::AvDatabaseRuntimeInfo info =
+        antivirus::service::GetDatabaseRuntimeInfo(g_avSignatureDatabase, g_avDatabaseLoaded);
+    FillRpcAvDatabaseInfo(info, databaseInfo);
+    return RPC_RESULT_OK;
+}
+
 extern "C" void* __RPC_USER MIDL_user_allocate(size_t size)
 {
     return std::malloc(size);
@@ -1796,8 +2032,29 @@ extern "C" void __RPC_USER MIDL_user_free(void* pointer)
     std::free(pointer);
 }
 
-int wmain()
+// Checks whether the process should run the AV engine self-test instead of SCM mode.
+bool IsAntivirusEngineSelfTestArgumentPresent(int argc, wchar_t** argv)
 {
+    for (int i = 1; i < argc; ++i)
+    {
+        if (argv[i] != nullptr
+            && (std::wcscmp(argv[i], L"--av-self-test") == 0
+                || std::wcscmp(argv[i], L"/av-self-test") == 0))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    if (IsAntivirusEngineSelfTestArgumentPresent(argc, argv))
+    {
+        return antivirus::service::RunAntivirusEngineSelfTest();
+    }
+
     SERVICE_TABLE_ENTRYW dispatchTable[] = {
         { const_cast<LPWSTR>(antivirus::common::kServiceName), ServiceMain },
         { nullptr, nullptr },

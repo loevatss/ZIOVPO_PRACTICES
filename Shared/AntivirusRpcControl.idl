@@ -39,6 +39,38 @@ interface AntivirusRpcControl
         wchar_t error[128];
     } RpcLicenseInfo;
 
+    typedef [v1_enum] enum RpcScanStatus
+    {
+        RPC_SCAN_STATUS_CLEAN = 0,
+        RPC_SCAN_STATUS_INFECTED = 1,
+        RPC_SCAN_STATUS_ERROR = 2
+    } RpcScanStatus;
+
+    typedef struct RpcAvDatabaseInfo
+    {
+        long loaded;
+        hyper recordCount;
+        wchar_t releaseDate[64];
+    } RpcAvDatabaseInfo;
+
+    typedef struct RpcScanFileResult
+    {
+        RpcScanStatus status;
+        wchar_t path[1024];
+        wchar_t objectType[32];
+        wchar_t recordId[128];
+        wchar_t message[256];
+    } RpcScanFileResult;
+
+    typedef struct RpcScanDirectoryResult
+    {
+        hyper totalScanned;
+        hyper infectedCount;
+        hyper errorCount;
+        long resultCount;
+        [size_is(resultCount)] RpcScanFileResult* results;
+    } RpcScanDirectoryResult;
+
     // Останавливает службу через существующий RPC.
     // Legacy endpoint: kept for ABI compatibility, service ignores it.
     void StopService(void);
@@ -71,4 +103,17 @@ interface AntivirusRpcControl
         [in, string] const wchar_t* deviceMac,
         [in] hyper productId,
         [out] RpcLicenseInfo* licenseInfo);
+
+    // Scans one selected file through the in-memory antivirus engine.
+    RpcResultCode ScanFile(
+        [in, string] const wchar_t* path,
+        [out] RpcScanFileResult* scanResult);
+
+    // Scans files in a selected directory recursively.
+    RpcResultCode ScanDirectory(
+        [in, string] const wchar_t* path,
+        [out] RpcScanDirectoryResult* scanResult);
+
+    // Returns current in-memory antivirus database metadata.
+    RpcResultCode GetAvDatabaseInfo([out] RpcAvDatabaseInfo* databaseInfo);
 }

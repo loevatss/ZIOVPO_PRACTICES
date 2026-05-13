@@ -11,8 +11,14 @@
 #include <cwctype>
 #include <cstdlib>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+#include <commdlg.h>
+#include <shlobj.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <rpc.h>
@@ -26,6 +32,8 @@
 #define MAX_LOADSTRING 100
 
 constexpr UINT WMAPP_TRAYICON = WM_APP + 1;
+constexpr UINT WMAPP_SCAN_FILE_DONE = WM_APP + 2;
+constexpr UINT WMAPP_SCAN_DIRECTORY_DONE = WM_APP + 3;
 constexpr UINT TRAY_ICON_UID = 1;
 constexpr DWORD SERVICE_START_TIMEOUT_MS = 30000;
 constexpr DWORD SERVICE_STATUS_POLL_INTERVAL_MS = 250;
@@ -45,6 +53,11 @@ constexpr int IDC_BUTTON_LOGOUT = 2011;
 constexpr int IDC_BUTTON_AV_ACTION = 2012;
 constexpr int IDC_LABEL_AV_STATUS = 2013;
 constexpr int IDC_LABEL_HEADER = 2014;
+constexpr int IDC_BUTTON_SCAN_DIRECTORY = 2015;
+constexpr int IDC_BUTTON_REFRESH_DATABASE = 2016;
+constexpr int IDC_LABEL_DATABASE_INFO = 2017;
+constexpr int IDC_LABEL_SCAN_SUMMARY = 2018;
+constexpr int IDC_LIST_SCAN_RESULTS = 2019;
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -72,9 +85,15 @@ HWND g_hLabelLicenseError = nullptr;
 HWND g_hButtonLogout = nullptr;
 HWND g_hButtonAvAction = nullptr;
 HWND g_hLabelAvStatus = nullptr;
+HWND g_hButtonScanDirectory = nullptr;
+HWND g_hButtonRefreshDatabase = nullptr;
+HWND g_hLabelDatabaseInfo = nullptr;
+HWND g_hLabelScanSummary = nullptr;
+HWND g_hListScanResults = nullptr;
 bool g_isAuthenticated = false;
 bool g_hasLicense = false;
 bool g_antivirusUnlocked = false;
+bool g_scanInProgress = false;
 RpcResultCode g_lastLicenseCode = RPC_RESULT_NO_LICENSE;
 std::wstring g_currentUsername;
 std::wstring g_currentLicenseExpirationDate;
@@ -86,6 +105,23 @@ HFONT g_hFontHeader = nullptr;
 HFONT g_hFontText = nullptr;
 HFONT g_hFontButton = nullptr;
 bool g_licenseRefreshInProgress = false;
+std::mutex g_rpcCallMutex;
+
+extern "C" void __RPC_USER MIDL_user_free(void* pointer);
+
+struct GuiFileScanCompletion
+{
+    bool rpcSucceeded = false;
+    std::wstring path;
+    RpcScanFileResult result{};
+};
+
+struct GuiDirectoryScanCompletion
+{
+    bool rpcSucceeded = false;
+    std::wstring path;
+    RpcScanDirectoryResult result{};
+};
 
 enum class ServiceRuntimeState
 {
@@ -128,16 +164,28 @@ bool ActivateProductViaRpc(
     const std::wstring& deviceMac,
     LONGLONG productId,
     RpcLicenseInfo& licenseInfo);
+bool QueryAvDatabaseInfoViaRpc(RpcAvDatabaseInfo& databaseInfo);
+bool ScanFileViaRpc(const std::wstring& path, RpcScanFileResult& scanResult);
+bool ScanDirectoryViaRpc(const std::wstring& path, RpcScanDirectoryResult& scanResult);
+void StartFileScanWorker(HWND hWnd, std::wstring path);
+void StartDirectoryScanWorker(HWND hWnd, std::wstring path);
+void FinishFileScan(HWND hWnd, GuiFileScanCompletion* completion);
+void FinishDirectoryScan(HWND hWnd, GuiDirectoryScanCompletion* completion);
 void CreateSecurityControls(HWND hWnd);
 void UpdateSecurityUi(HWND hWnd);
 void RefreshAuthState(HWND hWnd);
 void RefreshLicenseState(HWND hWnd);
+void RefreshAvDatabaseInfo(HWND hWnd);
 void HandleLoginAction(HWND hWnd);
 void HandleActivationAction(HWND hWnd);
 void HandleLogoutAction(HWND hWnd);
 void HandleAntivirusAction(HWND hWnd);
+void HandleScanDirectoryAction(HWND hWnd);
+void HandleRefreshDatabaseAction(HWND hWnd);
 std::wstring GetControlText(HWND hWnd);
 std::wstring TrimCopy(const std::wstring& text);
+bool TrySelectFile(HWND owner, std::wstring& path);
+bool TrySelectDirectory(HWND owner, std::wstring& path);
 std::wstring GetDefaultDeviceName();
 std::wstring GetDefaultDeviceMac();
 std::wstring BuildFallbackDeviceMac();
@@ -149,9 +197,16 @@ void DestroyFriendlyUiTheme();
 void ApplyControlFont(HWND control, HFONT font);
 void SetAuthErrorText(const std::wstring& text);
 void SetLicenseErrorText(const std::wstring& text);
+void SetDatabaseInfoText(const std::wstring& text);
+void SetScanSummaryText(const std::wstring& text);
+void ClearScanResults();
+void AddScanResultLine(const std::wstring& line);
 void ApplyAuthInfo(const RpcAuthInfo& authInfo);
 void ApplyLicenseInfo(const RpcLicenseInfo& licenseInfo);
 std::wstring RpcCodeToText(RpcResultCode code);
+std::wstring ScanStatusToText(RpcScanStatus status);
+std::wstring FormatScanFileResult(const RpcScanFileResult& result);
+std::wstring FormatScanSummary(const RpcScanDirectoryResult& result);
 
 namespace
 {
@@ -540,8 +595,10 @@ bool ShouldContinueGuiStartup(LPCWSTR commandLine)
 // Requests service stop through confirmed RPC endpoint.
 bool RequestConfirmedServiceStopViaRpc()
 {
+    g_rpcCallMutex.lock();
     if (!EnsureRpcBinding())
     {
+        g_rpcCallMutex.unlock();
         return false;
     }
 
@@ -557,6 +614,7 @@ bool RequestConfirmedServiceStopViaRpc()
     RpcEndExcept;
 
     ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
     return rpcCallSucceeded;
 }
 
@@ -606,8 +664,10 @@ void ReleaseRpcBinding()
 bool QueryCurrentAuthInfo(RpcAuthInfo& authInfo)
 {
     std::memset(&authInfo, 0, sizeof(authInfo));
+    g_rpcCallMutex.lock();
     if (!EnsureRpcBinding())
     {
+        g_rpcCallMutex.unlock();
         return false;
     }
 
@@ -624,6 +684,7 @@ bool QueryCurrentAuthInfo(RpcAuthInfo& authInfo)
     RpcEndExcept;
 
     ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
     return rpcCallSucceeded;
 }
 
@@ -631,8 +692,10 @@ bool QueryCurrentAuthInfo(RpcAuthInfo& authInfo)
 bool QueryActiveLicenseInfo(LONGLONG productId, const std::wstring& deviceMac, RpcLicenseInfo& licenseInfo)
 {
     std::memset(&licenseInfo, 0, sizeof(licenseInfo));
+    g_rpcCallMutex.lock();
     if (!EnsureRpcBinding())
     {
+        g_rpcCallMutex.unlock();
         return false;
     }
 
@@ -652,6 +715,7 @@ bool QueryActiveLicenseInfo(LONGLONG productId, const std::wstring& deviceMac, R
     RpcEndExcept;
 
     ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
     return rpcCallSucceeded;
 }
 
@@ -659,8 +723,10 @@ bool QueryActiveLicenseInfo(LONGLONG productId, const std::wstring& deviceMac, R
 bool LoginViaRpc(const std::wstring& username, const std::wstring& password, RpcAuthInfo& authInfo)
 {
     std::memset(&authInfo, 0, sizeof(authInfo));
+    g_rpcCallMutex.lock();
     if (!EnsureRpcBinding())
     {
+        g_rpcCallMutex.unlock();
         return false;
     }
 
@@ -677,6 +743,7 @@ bool LoginViaRpc(const std::wstring& username, const std::wstring& password, Rpc
     RpcEndExcept;
 
     ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
     return rpcCallSucceeded;
 }
 
@@ -685,8 +752,10 @@ bool LogoutViaRpc(RpcAuthInfo& authInfo, RpcLicenseInfo& licenseInfo)
 {
     std::memset(&authInfo, 0, sizeof(authInfo));
     std::memset(&licenseInfo, 0, sizeof(licenseInfo));
+    g_rpcCallMutex.lock();
     if (!EnsureRpcBinding())
     {
+        g_rpcCallMutex.unlock();
         return false;
     }
 
@@ -703,6 +772,7 @@ bool LogoutViaRpc(RpcAuthInfo& authInfo, RpcLicenseInfo& licenseInfo)
     RpcEndExcept;
 
     ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
     return rpcCallSucceeded;
 }
 
@@ -715,8 +785,10 @@ bool ActivateProductViaRpc(
     RpcLicenseInfo& licenseInfo)
 {
     std::memset(&licenseInfo, 0, sizeof(licenseInfo));
+    g_rpcCallMutex.lock();
     if (!EnsureRpcBinding())
     {
+        g_rpcCallMutex.unlock();
         return false;
     }
 
@@ -741,7 +813,193 @@ bool ActivateProductViaRpc(
     RpcEndExcept;
 
     ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
     return rpcCallSucceeded;
+}
+
+// Gets antivirus database metadata from the service.
+bool QueryAvDatabaseInfoViaRpc(RpcAvDatabaseInfo& databaseInfo)
+{
+    std::memset(&databaseInfo, 0, sizeof(databaseInfo));
+    g_rpcCallMutex.lock();
+    if (!EnsureRpcBinding())
+    {
+        g_rpcCallMutex.unlock();
+        return false;
+    }
+
+    bool rpcCallSucceeded = true;
+    RpcTryExcept
+    {
+        const RpcResultCode result = GetAvDatabaseInfo(&databaseInfo);
+        rpcCallSucceeded = (result == RPC_RESULT_OK);
+    }
+    RpcExcept(EXCEPTION_EXECUTE_HANDLER)
+    {
+        rpcCallSucceeded = false;
+    }
+    RpcEndExcept;
+
+    ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
+    return rpcCallSucceeded;
+}
+
+// Calls service RPC to scan one selected file.
+bool ScanFileViaRpc(const std::wstring& path, RpcScanFileResult& scanResult)
+{
+    std::memset(&scanResult, 0, sizeof(scanResult));
+    g_rpcCallMutex.lock();
+    if (!EnsureRpcBinding())
+    {
+        g_rpcCallMutex.unlock();
+        return false;
+    }
+
+    bool rpcCallSucceeded = true;
+    RpcTryExcept
+    {
+        const RpcResultCode result = ScanFile(path.c_str(), &scanResult);
+        rpcCallSucceeded = (result == RPC_RESULT_OK);
+    }
+    RpcExcept(EXCEPTION_EXECUTE_HANDLER)
+    {
+        rpcCallSucceeded = false;
+    }
+    RpcEndExcept;
+
+    ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
+    return rpcCallSucceeded;
+}
+
+// Calls service RPC to scan one selected directory.
+bool ScanDirectoryViaRpc(const std::wstring& path, RpcScanDirectoryResult& scanResult)
+{
+    std::memset(&scanResult, 0, sizeof(scanResult));
+    g_rpcCallMutex.lock();
+    if (!EnsureRpcBinding())
+    {
+        g_rpcCallMutex.unlock();
+        return false;
+    }
+
+    bool rpcCallSucceeded = true;
+    RpcTryExcept
+    {
+        const RpcResultCode result = ScanDirectory(path.c_str(), &scanResult);
+        rpcCallSucceeded = (result == RPC_RESULT_OK);
+    }
+    RpcExcept(EXCEPTION_EXECUTE_HANDLER)
+    {
+        rpcCallSucceeded = false;
+    }
+    RpcEndExcept;
+
+    ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
+    return rpcCallSucceeded;
+}
+
+// Starts a background RPC file scan so the GUI thread stays responsive.
+void StartFileScanWorker(HWND hWnd, std::wstring path)
+{
+    std::thread([hWnd, path = std::move(path)]() {
+        auto completion = std::make_unique<GuiFileScanCompletion>();
+        completion->path = path;
+        completion->rpcSucceeded = ScanFileViaRpc(path, completion->result);
+
+        if (!PostMessageW(hWnd, WMAPP_SCAN_FILE_DONE, 0, reinterpret_cast<LPARAM>(completion.get())))
+        {
+            return;
+        }
+
+        completion.release();
+    }).detach();
+}
+
+// Starts a background RPC directory scan so the GUI thread stays responsive.
+void StartDirectoryScanWorker(HWND hWnd, std::wstring path)
+{
+    std::thread([hWnd, path = std::move(path)]() {
+        auto completion = std::make_unique<GuiDirectoryScanCompletion>();
+        completion->path = path;
+        completion->rpcSucceeded = ScanDirectoryViaRpc(path, completion->result);
+
+        if (!PostMessageW(hWnd, WMAPP_SCAN_DIRECTORY_DONE, 0, reinterpret_cast<LPARAM>(completion.get())))
+        {
+            if (completion->result.results != nullptr)
+            {
+                MIDL_user_free(completion->result.results);
+                completion->result.results = nullptr;
+            }
+            return;
+        }
+
+        completion.release();
+    }).detach();
+}
+
+// Applies a completed background file scan to visible UI state.
+void FinishFileScan(HWND hWnd, GuiFileScanCompletion* completion)
+{
+    std::unique_ptr<GuiFileScanCompletion> owned(completion);
+    g_scanInProgress = false;
+
+    if (!owned)
+    {
+        SetScanSummaryText(L"File scan: internal error");
+        UpdateSecurityUi(hWnd);
+        return;
+    }
+
+    if (!owned->rpcSucceeded)
+    {
+        SetScanSummaryText(L"File scan: RPC error");
+        AddScanResultLine(L"[error] " + owned->path + L" | Failed to call service ScanFile.");
+        UpdateSecurityUi(hWnd);
+        return;
+    }
+
+    SetScanSummaryText(L"File scan: " + ScanStatusToText(owned->result.status));
+    AddScanResultLine(FormatScanFileResult(owned->result));
+    UpdateSecurityUi(hWnd);
+}
+
+// Applies a completed background directory scan to visible UI state.
+void FinishDirectoryScan(HWND hWnd, GuiDirectoryScanCompletion* completion)
+{
+    std::unique_ptr<GuiDirectoryScanCompletion> owned(completion);
+    g_scanInProgress = false;
+
+    if (!owned)
+    {
+        SetScanSummaryText(L"Directory scan: internal error");
+        UpdateSecurityUi(hWnd);
+        return;
+    }
+
+    if (!owned->rpcSucceeded)
+    {
+        SetScanSummaryText(L"Directory scan: RPC error");
+        AddScanResultLine(L"[error] " + owned->path + L" | Failed to call service ScanDirectory.");
+        UpdateSecurityUi(hWnd);
+        return;
+    }
+
+    SetScanSummaryText(FormatScanSummary(owned->result));
+    for (long i = 0; i < owned->result.resultCount; ++i)
+    {
+        AddScanResultLine(FormatScanFileResult(owned->result.results[i]));
+    }
+
+    if (owned->result.results != nullptr)
+    {
+        MIDL_user_free(owned->result.results);
+        owned->result.results = nullptr;
+    }
+
+    UpdateSecurityUi(hWnd);
 }
 
 // Reads text from a control.
@@ -780,6 +1038,54 @@ std::wstring TrimCopy(const std::wstring& text)
     }
 
     return text.substr(begin, end - begin);
+}
+
+// Shows the standard file picker for selecting a file to scan.
+bool TrySelectFile(HWND owner, std::wstring& path)
+{
+    WCHAR buffer[32768]{};
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFile = buffer;
+    dialog.nMaxFile = static_cast<DWORD>(_countof(buffer));
+    dialog.lpstrTitle = L"Select file to scan";
+    dialog.lpstrFilter = L"All files\0*.*\0";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (!GetOpenFileNameW(&dialog))
+    {
+        return false;
+    }
+
+    path = buffer;
+    return !path.empty();
+}
+
+// Shows the standard folder picker for selecting a directory to scan.
+bool TrySelectDirectory(HWND owner, std::wstring& path)
+{
+    BROWSEINFOW browseInfo{};
+    browseInfo.hwndOwner = owner;
+    browseInfo.lpszTitle = L"Select directory to scan";
+    browseInfo.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    PIDLIST_ABSOLUTE itemList = SHBrowseForFolderW(&browseInfo);
+    if (itemList == nullptr)
+    {
+        return false;
+    }
+
+    WCHAR buffer[MAX_PATH]{};
+    const BOOL converted = SHGetPathFromIDListW(itemList, buffer);
+    CoTaskMemFree(itemList);
+    if (!converted)
+    {
+        return false;
+    }
+
+    path = buffer;
+    return !path.empty();
 }
 
 // Gets host name to use as default device name.
@@ -1003,6 +1309,42 @@ void SetLicenseErrorText(const std::wstring& text)
     }
 }
 
+// Sets antivirus database metadata label text.
+void SetDatabaseInfoText(const std::wstring& text)
+{
+    if (g_hLabelDatabaseInfo != nullptr)
+    {
+        SetWindowTextW(g_hLabelDatabaseInfo, text.c_str());
+    }
+}
+
+// Sets scan summary label text.
+void SetScanSummaryText(const std::wstring& text)
+{
+    if (g_hLabelScanSummary != nullptr)
+    {
+        SetWindowTextW(g_hLabelScanSummary, text.c_str());
+    }
+}
+
+// Clears the visible scan results list.
+void ClearScanResults()
+{
+    if (g_hListScanResults != nullptr)
+    {
+        SendMessageW(g_hListScanResults, LB_RESETCONTENT, 0, 0);
+    }
+}
+
+// Appends one visible scan result line.
+void AddScanResultLine(const std::wstring& line)
+{
+    if (g_hListScanResults != nullptr)
+    {
+        SendMessageW(g_hListScanResults, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
+    }
+}
+
 // Applies auth info into local GUI state.
 void ApplyAuthInfo(const RpcAuthInfo& authInfo)
 {
@@ -1058,6 +1400,56 @@ std::wstring RpcCodeToText(RpcResultCode code)
     }
 }
 
+// Converts RPC scan status into user-facing text.
+std::wstring ScanStatusToText(RpcScanStatus status)
+{
+    switch (status)
+    {
+    case RPC_SCAN_STATUS_INFECTED:
+        return L"infected";
+    case RPC_SCAN_STATUS_ERROR:
+        return L"error";
+    default:
+        return L"clean";
+    }
+}
+
+// Formats one RPC file scan result for the visible result list.
+std::wstring FormatScanFileResult(const RpcScanFileResult& result)
+{
+    std::wstringstream line;
+    line
+        << L"[" << ScanStatusToText(result.status) << L"] "
+        << result.path
+        << L" | type=" << (result.objectType[0] != L'\0' ? result.objectType : L"-");
+
+    if (result.recordId[0] != L'\0')
+    {
+        line << L" | signature=" << result.recordId;
+    }
+
+    if (result.message[0] != L'\0')
+    {
+        line << L" | " << result.message;
+    }
+
+    return line.str();
+}
+
+// Formats directory scan aggregate counters for the summary label.
+std::wstring FormatScanSummary(const RpcScanDirectoryResult& result)
+{
+    std::wstringstream summary;
+    summary
+        << L"Directory scan: total="
+        << static_cast<long long>(result.totalScanned)
+        << L", infected="
+        << static_cast<long long>(result.infectedCount)
+        << L", errors="
+        << static_cast<long long>(result.errorCount);
+    return summary.str();
+}
+
 // Creates all runtime controls for auth/license UX.
 void CreateSecurityControls(HWND hWnd)
 {
@@ -1071,52 +1463,68 @@ void CreateSecurityControls(HWND hWnd)
         WS_CHILD | WS_VISIBLE, 24, 90, 700, 24, hWnd, MenuIdFromInt(IDC_LABEL_LICENSE), hInst, nullptr);
     g_hLabelAvStatus = CreateWindowExW(0, L"STATIC", L"Antivirus: blocked",
         WS_CHILD | WS_VISIBLE, 24, 118, 700, 24, hWnd, MenuIdFromInt(IDC_LABEL_AV_STATUS), hInst, nullptr);
+    g_hLabelDatabaseInfo = CreateWindowExW(0, L"STATIC", L"Database: loading...",
+        WS_CHILD | WS_VISIBLE, 24, 142, 620, 24, hWnd, MenuIdFromInt(IDC_LABEL_DATABASE_INFO), hInst, nullptr);
+    g_hButtonRefreshDatabase = CreateWindowExW(0, L"BUTTON", L"Refresh DB",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 716, 138, 140, 30, hWnd,
+        MenuIdFromInt(IDC_BUTTON_REFRESH_DATABASE), hInst, nullptr);
 
     g_hLabelUsernameCaption = CreateWindowExW(0, L"STATIC", L"Username",
-        WS_CHILD | WS_VISIBLE, 36, 164, 120, 20, hWnd, nullptr, hInst, nullptr);
+        WS_CHILD | WS_VISIBLE, 36, 194, 120, 20, hWnd, nullptr, hInst, nullptr);
     g_hEditUsername = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 36, 186, 250, 28, hWnd,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 36, 216, 250, 28, hWnd,
         MenuIdFromInt(IDC_EDIT_USERNAME), hInst, nullptr);
     g_hLabelPasswordCaption = CreateWindowExW(0, L"STATIC", L"Password",
-        WS_CHILD | WS_VISIBLE, 36, 224, 120, 20, hWnd, nullptr, hInst, nullptr);
+        WS_CHILD | WS_VISIBLE, 36, 254, 120, 20, hWnd, nullptr, hInst, nullptr);
     g_hEditPassword = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_PASSWORD, 36, 246, 250, 28, hWnd,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_PASSWORD, 36, 276, 250, 28, hWnd,
         MenuIdFromInt(IDC_EDIT_PASSWORD), hInst, nullptr);
     g_hButtonLogin = CreateWindowExW(0, L"BUTTON", L"Sign in",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 304, 186, 140, 88, hWnd,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 304, 216, 140, 88, hWnd,
         MenuIdFromInt(IDC_BUTTON_LOGIN), hInst, nullptr);
     g_hLabelAuthError = CreateWindowExW(0, L"STATIC", L"",
-        WS_CHILD | WS_VISIBLE, 36, 282, 408, 36, hWnd,
+        WS_CHILD | WS_VISIBLE, 36, 312, 408, 36, hWnd,
         MenuIdFromInt(IDC_LABEL_AUTH_ERROR), hInst, nullptr);
 
     g_hLabelActivationCaption = CreateWindowExW(0, L"STATIC", L"Activation code",
-        WS_CHILD | WS_VISIBLE, 468, 164, 220, 20, hWnd, nullptr, hInst, nullptr);
+        WS_CHILD | WS_VISIBLE, 486, 194, 220, 20, hWnd, nullptr, hInst, nullptr);
     g_hEditActivation = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 468, 186, 248, 28, hWnd,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 486, 216, 248, 28, hWnd,
         MenuIdFromInt(IDC_EDIT_ACTIVATION), hInst, nullptr);
     g_hLabelProductIdCaption = CreateWindowExW(0, L"STATIC", L"Product ID",
-        WS_CHILD | WS_VISIBLE, 468, 224, 220, 20, hWnd, nullptr, hInst, nullptr);
+        WS_CHILD | WS_VISIBLE, 486, 254, 220, 20, hWnd, nullptr, hInst, nullptr);
     g_hEditProductId = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 468, 246, 128, 28, hWnd,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 486, 276, 128, 28, hWnd,
         MenuIdFromInt(IDC_EDIT_PRODUCT_ID), hInst, nullptr);
     g_hButtonActivate = CreateWindowExW(0, L"BUTTON", L"Activate",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 604, 246, 112, 28, hWnd,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 622, 276, 112, 28, hWnd,
         MenuIdFromInt(IDC_BUTTON_ACTIVATE), hInst, nullptr);
     g_hLabelLicenseError = CreateWindowExW(0, L"STATIC", L"",
-        WS_CHILD | WS_VISIBLE, 468, 282, 248, 36, hWnd,
+        WS_CHILD | WS_VISIBLE, 486, 312, 370, 36, hWnd,
         MenuIdFromInt(IDC_LABEL_LICENSE_ERROR), hInst, nullptr);
 
     g_hButtonLogout = CreateWindowExW(0, L"BUTTON", L"Logout",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 468, 332, 120, 32, hWnd,
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 486, 362, 120, 32, hWnd,
         MenuIdFromInt(IDC_BUTTON_LOGOUT), hInst, nullptr);
-    g_hButtonAvAction = CreateWindowExW(0, L"BUTTON", L"Start scan",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 596, 332, 120, 32, hWnd,
+    g_hButtonAvAction = CreateWindowExW(0, L"BUTTON", L"Scan file",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 36, 430, 140, 32, hWnd,
         MenuIdFromInt(IDC_BUTTON_AV_ACTION), hInst, nullptr);
+    g_hButtonScanDirectory = CreateWindowExW(0, L"BUTTON", L"Scan folder",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 186, 430, 140, 32, hWnd,
+        MenuIdFromInt(IDC_BUTTON_SCAN_DIRECTORY), hInst, nullptr);
+    g_hLabelScanSummary = CreateWindowExW(0, L"STATIC", L"Scan results: no scan yet",
+        WS_CHILD | WS_VISIBLE, 36, 470, 820, 24, hWnd,
+        MenuIdFromInt(IDC_LABEL_SCAN_SUMMARY), hInst, nullptr);
+    g_hListScanResults = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
+        36, 500, 820, 150, hWnd, MenuIdFromInt(IDC_LIST_SCAN_RESULTS), hInst, nullptr);
 
     ApplyControlFont(g_hLabelHeader, g_hFontHeader);
     ApplyControlFont(g_hLabelAuth, g_hFontText);
     ApplyControlFont(g_hLabelLicense, g_hFontText);
     ApplyControlFont(g_hLabelAvStatus, g_hFontText);
+    ApplyControlFont(g_hLabelDatabaseInfo, g_hFontText);
+    ApplyControlFont(g_hButtonRefreshDatabase, g_hFontButton);
     ApplyControlFont(g_hLabelUsernameCaption, g_hFontText);
     ApplyControlFont(g_hLabelPasswordCaption, g_hFontText);
     ApplyControlFont(g_hEditUsername, g_hFontText);
@@ -1131,6 +1539,9 @@ void CreateSecurityControls(HWND hWnd)
     ApplyControlFont(g_hLabelLicenseError, g_hFontText);
     ApplyControlFont(g_hButtonLogout, g_hFontButton);
     ApplyControlFont(g_hButtonAvAction, g_hFontButton);
+    ApplyControlFont(g_hButtonScanDirectory, g_hFontButton);
+    ApplyControlFont(g_hLabelScanSummary, g_hFontText);
+    ApplyControlFont(g_hListScanResults, g_hFontText);
 }
 
 // Updates UI from current auth/license state.
@@ -1180,8 +1591,10 @@ void UpdateSecurityUi(HWND hWnd)
     ShowWindow(g_hLabelLicenseError, showLicenseForm);
 
     ShowWindow(g_hButtonLogout, g_isAuthenticated ? TRUE : FALSE);
-    const BOOL enableAntivirusButton = (g_isAuthenticated && g_antivirusUnlocked) ? TRUE : FALSE;
-    EnableWindow(g_hButtonAvAction, enableAntivirusButton);
+    const BOOL enableScanButtons = (g_antivirusUnlocked && !g_scanInProgress) ? TRUE : FALSE;
+    EnableWindow(g_hButtonAvAction, enableScanButtons);
+    EnableWindow(g_hButtonScanDirectory, enableScanButtons);
+    EnableWindow(g_hButtonRefreshDatabase, TRUE);
     RedrawWindow(g_hButtonAvAction, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
 }
 
@@ -1258,6 +1671,29 @@ void RefreshLicenseState(HWND hWnd)
     SetLicenseErrorText(g_currentLicenseError);
     UpdateSecurityUi(hWnd);
     finishRefresh();
+}
+
+// Pulls antivirus database metadata from service and refreshes the view.
+void RefreshAvDatabaseInfo(HWND hWnd)
+{
+    UNREFERENCED_PARAMETER(hWnd);
+
+    RpcAvDatabaseInfo databaseInfo{};
+    if (!QueryAvDatabaseInfoViaRpc(databaseInfo))
+    {
+        SetDatabaseInfoText(L"Database: RPC error while reading database info");
+        return;
+    }
+
+    std::wstringstream text;
+    text
+        << L"Database: "
+        << (databaseInfo.loaded != 0 ? L"loaded" : L"not loaded")
+        << L", release="
+        << (databaseInfo.releaseDate[0] != L'\0' ? databaseInfo.releaseDate : L"-")
+        << L", records="
+        << static_cast<long long>(databaseInfo.recordCount);
+    SetDatabaseInfoText(text.str());
 }
 
 // Handles login action in UI.
@@ -1348,21 +1784,54 @@ void HandleLogoutAction(HWND hWnd)
     UpdateSecurityUi(hWnd);
 }
 
-// Handles antivirus action and blocks when license is invalid.
+// Handles file selection and calls service RPC to scan the selected file.
 void HandleAntivirusAction(HWND hWnd)
 {
-    RefreshLicenseState(hWnd);
-    if (!g_antivirusUnlocked)
+    if (!g_antivirusUnlocked || g_scanInProgress)
     {
-        MessageBoxW(
-            hWnd,
-            L"Antivirus functionality is blocked. Check authentication and license state.",
-            L"Antivirus",
-            MB_OK | MB_ICONWARNING);
+        SetScanSummaryText(L"File scan: authentication and active license are required");
         return;
     }
 
-    MessageBoxW(hWnd, L"Antivirus task started.", L"Antivirus", MB_OK | MB_ICONINFORMATION);
+    std::wstring path;
+    if (!TrySelectFile(hWnd, path))
+    {
+        return;
+    }
+
+    SetScanSummaryText(L"File scan: running...");
+    ClearScanResults();
+    g_scanInProgress = true;
+    UpdateSecurityUi(hWnd);
+    StartFileScanWorker(hWnd, std::move(path));
+}
+
+// Handles directory selection and calls service RPC to scan it recursively.
+void HandleScanDirectoryAction(HWND hWnd)
+{
+    if (!g_antivirusUnlocked || g_scanInProgress)
+    {
+        SetScanSummaryText(L"Directory scan: authentication and active license are required");
+        return;
+    }
+
+    std::wstring path;
+    if (!TrySelectDirectory(hWnd, path))
+    {
+        return;
+    }
+
+    SetScanSummaryText(L"Directory scan: running...");
+    ClearScanResults();
+    g_scanInProgress = true;
+    UpdateSecurityUi(hWnd);
+    StartDirectoryScanWorker(hWnd, std::move(path));
+}
+
+// Handles manual antivirus database metadata refresh.
+void HandleRefreshDatabaseAction(HWND hWnd)
+{
+    RefreshAvDatabaseInfo(hWnd);
 }
 
 void RequestServiceStopAndExit(HWND hWnd)
@@ -1481,7 +1950,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     hInst = hInstance;
 
     HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, 0, 760, 440, nullptr, nullptr, hInstance, nullptr);
+        CW_USEDEFAULT, 0, 920, 720, nullptr, nullptr, hInstance, nullptr);
 
     if (hWnd == nullptr)
     {
@@ -1497,6 +1966,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     g_defaultDeviceName = GetDefaultDeviceName();
     g_defaultDeviceMac = GetDefaultDeviceMac();
     CreateSecurityControls(hWnd);
+    RefreshAvDatabaseInfo(hWnd);
     RefreshAuthState(hWnd);
     SetTimer(hWnd, LICENSE_POLL_TIMER_ID, LICENSE_POLL_INTERVAL_MS, nullptr);
 
@@ -1523,6 +1993,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         return HandleTrayIconMessage(hWnd, lParam);
     }
 
+    if (message == WMAPP_SCAN_FILE_DONE)
+    {
+        FinishFileScan(hWnd, reinterpret_cast<GuiFileScanCompletion*>(lParam));
+        return 0;
+    }
+
+    if (message == WMAPP_SCAN_DIRECTORY_DONE)
+    {
+        FinishDirectoryScan(hWnd, reinterpret_cast<GuiDirectoryScanCompletion*>(lParam));
+        return 0;
+    }
+
     switch (message)
     {
     case WM_COMMAND:
@@ -1544,6 +2026,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             return 0;
         case IDC_BUTTON_AV_ACTION:
             HandleAntivirusAction(hWnd);
+            return 0;
+        case IDC_BUTTON_SCAN_DIRECTORY:
+            HandleScanDirectoryAction(hWnd);
+            return 0;
+        case IDC_BUTTON_REFRESH_DATABASE:
+            HandleRefreshDatabaseAction(hWnd);
             return 0;
         case IDM_TRAY_OPEN:
             ShowMainWindow(hWnd);
@@ -1628,8 +2116,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         HPEN cardPen = CreatePen(PS_SOLID, 1, RGB(216, 225, 236));
         const HGDIOBJ oldBrush = SelectObject(hdc, cardBrush);
         const HGDIOBJ oldPen = SelectObject(hdc, cardPen);
-        RoundRect(hdc, 18, 150, 456, 332, 14, 14);
-        RoundRect(hdc, 450, 150, 732, 396, 14, 14);
+        RoundRect(hdc, 18, 180, 468, 362, 14, 14);
+        RoundRect(hdc, 468, 180, 874, 408, 14, 14);
+        RoundRect(hdc, 18, 418, 874, 664, 14, 14);
         SelectObject(hdc, oldPen);
         SelectObject(hdc, oldBrush);
         DeleteObject(cardPen);

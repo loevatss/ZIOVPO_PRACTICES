@@ -1192,7 +1192,10 @@ inline bool ApiClient::ParseLicenseState(const std::string& json, LicenseState* 
     detail::GetString(ticketJson, "serverDate", &s.ticket.serverDate);
     detail::GetInt64(ticketJson, "ticketTtlSeconds", &s.ticket.ticketTtlSeconds);
     detail::GetString(ticketJson, "licenseActivationDate", &s.ticket.licenseActivationDate);
-    detail::GetString(ticketJson, "licenseExpirationDate", &s.ticket.licenseExpirationDate);
+    if (!detail::GetString(ticketJson, "licenseExpirationDate", &s.ticket.licenseExpirationDate))
+    {
+        detail::GetString(ticketJson, "endingDate", &s.ticket.licenseExpirationDate);
+    }
     detail::GetBool(ticketJson, "licenseBlocked", &s.ticket.licenseBlocked);
     long long userId = 0;
     if (detail::GetInt64(ticketJson, "userId", &userId))

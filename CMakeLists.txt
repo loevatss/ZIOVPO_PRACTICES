@@ -179,6 +179,12 @@ target_link_libraries(Antivirus PRIVATE Advapi32 Rpcrt4 Shell32)
 generate_rpc_sources(AntivirusService SERVICE_RPC_HEADER SERVICE_RPC_CLIENT_STUB SERVICE_RPC_SERVER_STUB)
 add_executable(AntivirusService
     AntivirusService/service.cpp
+    AntivirusService/AntivirusEngineSelfTest.cpp
+    AntivirusService/AntivirusEngineSelfTest.h
+    AntivirusService/AntivirusScanService.cpp
+    AntivirusService/AntivirusScanService.h
+    Shared/AntivirusEngine.cpp
+    Shared/AntivirusEngine.h
     Shared/ProcessProtection.cpp
     Shared/ProcessProtection.h
     Shared/ServiceProtection.cpp
