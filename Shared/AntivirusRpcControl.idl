@@ -9,5 +9,111 @@ import "rpcndr.idl";
 ]
 interface AntivirusRpcControl
 {
+    typedef [v1_enum] enum RpcResultCode
+    {
+        RPC_RESULT_OK = 0,
+        RPC_RESULT_INVALID_ARGUMENT = 1,
+        RPC_RESULT_AUTH_FAILED = 2,
+        RPC_RESULT_NOT_AUTHENTICATED = 3,
+        RPC_RESULT_NETWORK_ERROR = 4,
+        RPC_RESULT_NO_LICENSE = 5,
+        RPC_RESULT_LICENSE_EXPIRED = 6,
+        RPC_RESULT_LICENSE_BLOCKED = 7,
+        RPC_RESULT_INTERNAL_ERROR = 8
+    } RpcResultCode;
+
+    typedef struct RpcAuthInfo
+    {
+        long authenticated;
+        long hasUserId;
+        hyper userId;
+        wchar_t username[128];
+    } RpcAuthInfo;
+
+    typedef struct RpcLicenseInfo
+    {
+        long hasLicense;
+        long blocked;
+        long errorCode;
+        wchar_t expirationDate[64];
+        wchar_t error[128];
+    } RpcLicenseInfo;
+
+    typedef [v1_enum] enum RpcScanStatus
+    {
+        RPC_SCAN_STATUS_CLEAN = 0,
+        RPC_SCAN_STATUS_INFECTED = 1,
+        RPC_SCAN_STATUS_ERROR = 2
+    } RpcScanStatus;
+
+    typedef struct RpcAvDatabaseInfo
+    {
+        long loaded;
+        hyper recordCount;
+        wchar_t releaseDate[64];
+    } RpcAvDatabaseInfo;
+
+    typedef struct RpcScanFileResult
+    {
+        RpcScanStatus status;
+        wchar_t path[1024];
+        wchar_t objectType[32];
+        wchar_t recordId[128];
+        wchar_t message[256];
+    } RpcScanFileResult;
+
+    typedef struct RpcScanDirectoryResult
+    {
+        hyper totalScanned;
+        hyper infectedCount;
+        hyper errorCount;
+        long resultCount;
+        [size_is(resultCount)] RpcScanFileResult* results;
+    } RpcScanDirectoryResult;
+
+    // Останавливает службу через существующий RPC.
+    // Legacy endpoint: kept for ABI compatibility, service ignores it.
     void StopService(void);
+
+    // Останавливает службу после подтверждения в пользовательской GUI session.
+    void ConfirmStop(void);
+
+    // Возвращает безопасную информацию о текущем пользователе.
+    RpcResultCode GetCurrentAuthInfo([out] RpcAuthInfo* authInfo);
+
+    // Выполняет login и сохраняет токены только в памяти службы.
+    RpcResultCode LoginUser(
+        [in, string] const wchar_t* username,
+        [in, string] const wchar_t* password,
+        [out] RpcAuthInfo* authInfo);
+
+    // Выполняет logout и очищает auth/license состояние в памяти.
+    RpcResultCode LogoutUser([out] RpcAuthInfo* authInfo, [out] RpcLicenseInfo* licenseInfo);
+
+    // Запрашивает и возвращает безопасное состояние лицензии.
+    RpcResultCode GetActiveLicenseInfo(
+        [in] hyper productId,
+        [in, string] const wchar_t* deviceMac,
+        [out] RpcLicenseInfo* licenseInfo);
+
+    // Активирует продукт и возвращает безопасное состояние лицензии.
+    RpcResultCode ActivateProduct(
+        [in, string] const wchar_t* activationKey,
+        [in, string] const wchar_t* deviceName,
+        [in, string] const wchar_t* deviceMac,
+        [in] hyper productId,
+        [out] RpcLicenseInfo* licenseInfo);
+
+    // Scans one selected file through the in-memory antivirus engine.
+    RpcResultCode ScanFile(
+        [in, string] const wchar_t* path,
+        [out] RpcScanFileResult* scanResult);
+
+    // Scans files in a selected directory recursively.
+    RpcResultCode ScanDirectory(
+        [in, string] const wchar_t* path,
+        [out] RpcScanDirectoryResult* scanResult);
+
+    // Returns current in-memory antivirus database metadata.
+    RpcResultCode GetAvDatabaseInfo([out] RpcAvDatabaseInfo* databaseInfo);
 }

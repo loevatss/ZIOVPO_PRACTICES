@@ -239,10 +239,22 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
+    <ClInclude Include="UserDesktopSession.h" />
+    <ClInclude Include="UserIsolatedStopConfirmation.h" />
+    <ClInclude Include="..\Shared\ProcessProtection.h" />
     <ClInclude Include="..\Shared\ServiceCommon.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Antivirus.cpp" />
+    <ClCompile Include="UserDesktopSession.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="UserIsolatedStopConfirmation.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\Shared\ProcessProtection.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="$(IntDir)Generated\AntivirusRpcControl_c.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
