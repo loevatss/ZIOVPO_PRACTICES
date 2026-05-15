@@ -17,6 +17,6 @@
 
 # Защита процессов и service object
 
-Служба и tray GUI ужесточают DACL своих process object: для BUILTIN\Users запрещается PROCESS_TERMINATE, а для BUILTIN\Administrators это поведение включается отдельной политикой в коде. Service object дополнительно получает DACL, запрещающую SERVICE_STOP для BUILTIN\Users и, при включенной политике, для BUILTIN\Administrators.
+Служба и tray GUI ужесточают DACL своих process object: для BUILTIN\Users запрещается PROCESS_TERMINATE, а для BUILTIN\Administrators это поведение включается отдельной политикой в коде. Service object больше не блокирует штатный `SERVICE_STOP` для BUILTIN\Users или BUILTIN\Administrators, чтобы uninstall и upgrade могли корректно останавливать службу через SCM.
 
 Это полноценная user-mode ACL/DACL защита от обычных пользователей и стандартных команд вроде taskkill/sc stop без специальных привилегий. Для администраторов защита частичная: elevated administrator с SeDebugPrivilege потенциально может обойти process DACL или изменить ACL. Абсолютная kill-proof защита в Windows user-mode невозможна; для полноценной защиты нужны kernel-mode driver, ObRegisterCallbacks и/или PPL.

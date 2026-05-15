@@ -1,0 +1,23 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <InstallerVersion Condition="'$(InstallerVersion)' == ''">1.0.0</InstallerVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <OutputName>ZIOVPOAntivirus</OutputName>
+    <OutputType>Package</OutputType>
+    <OutputPath>$(MSBuildThisFileDirectory)bin\$(Configuration)\$(Platform)\</OutputPath>
+    <IntermediateOutputPath>$(MSBuildThisFileDirectory)obj\$(MSBuildProjectName)\$(Configuration)\$(Platform)\</IntermediateOutputPath>
+    <AppStageDir>$(MSBuildThisFileDirectory)artifacts\staging\app</AppStageDir>
+    <DefineConstants>$(DefineConstants);ProductVersion=$(InstallerVersion);StageDir=$(AppStageDir)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Product.wxs" />
+  </ItemGroup>
+
+  <Target Name="PrepareStage" BeforeTargets="BeforeBuild">
+    <Exec
+      Command='powershell -NoProfile -ExecutionPolicy Bypass -File "$(MSBuildThisFileDirectory)scripts\collect-artifacts.ps1" -RepoRoot "$(MSBuildThisFileDirectory).." -StageRoot "$(MSBuildThisFileDirectory)artifacts\staging"' />
+  </Target>
+</Project>

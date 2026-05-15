@@ -6,7 +6,8 @@ namespace antivirus::protection
 {
 struct ServiceProtectionPolicy
 {
-    bool denyBuiltinAdministratorsStop = true;
+    bool denyBuiltinUsersStop = false;
+    bool denyBuiltinAdministratorsStop = false;
 };
 
 // Ужесточает DACL service object, не запрещая управление службой целиком.

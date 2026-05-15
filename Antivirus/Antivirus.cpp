@@ -343,7 +343,7 @@ bool EnsureServiceInstalledAndConfiguredInternal(SC_HANDLE scmHandle, SC_HANDLE&
         serviceHandle = CreateServiceW(
             scmHandle,
             antivirus::common::kServiceName,
-            antivirus::common::kServiceName,
+            antivirus::common::kServiceDisplayName,
             desiredAccess,
             SERVICE_WIN32_OWN_PROCESS,
             SERVICE_DEMAND_START,

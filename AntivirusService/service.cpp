@@ -32,6 +32,8 @@
 #include "ServiceProtection.h"
 #include "WebApiIntegration.h"
 
+void RequestConfirmedServiceStop();
+
 namespace
 {
 struct GuiProcessInfo
@@ -72,7 +74,9 @@ constexpr DWORD kServiceStartTimeoutMs = 30000;
 constexpr DWORD kServiceStatusPollIntervalMs = 250;
 constexpr DWORD kGuiSessionMonitorIntervalMs = 15000;
 constexpr bool kDenyAdministratorsProcessTerminate = true;
-constexpr bool kDenyAdministratorsServiceStop = true;
+constexpr bool kDenyServiceStopForUsers = false;
+constexpr bool kDenyServiceStopForAdministrators = false;
+constexpr bool kRestrictServiceSecurityWritesForAdministrators = false;
 
 std::mutex g_guiProcessesMutex;
 std::unordered_map<DWORD, GuiProcessInfo> g_guiProcessesBySession;
@@ -1343,6 +1347,7 @@ void DebugLogServiceProtection(const wchar_t* message)
     DebugLogService(L"%ls", message);
 }
 
+
 // Применяет user-mode защиту к process object службы и к service object.
 void HardenRunningServiceObjects()
 {
@@ -1354,11 +1359,14 @@ void HardenRunningServiceObjects()
     }
 
     antivirus::protection::ServiceProtectionPolicy servicePolicy{};
-    servicePolicy.denyBuiltinAdministratorsStop = kDenyAdministratorsServiceStop;
+    servicePolicy.denyBuiltinUsersStop = kDenyServiceStopForUsers;
+    servicePolicy.denyBuiltinAdministratorsStop = kDenyServiceStopForAdministrators;
     if (!antivirus::protection::HardenServiceObject(antivirus::common::kServiceName, servicePolicy))
     {
         DebugLogServiceProtection(L"service object hardening failed; service keeps running");
     }
+
+    UNREFERENCED_PARAMETER(kRestrictServiceSecurityWritesForAdministrators);
 }
 
 void ReportServiceStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint)
@@ -1371,7 +1379,9 @@ void ReportServiceStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint
     g_serviceStatus.dwServiceSpecificExitCode = 0;
     g_serviceStatus.dwWaitHint = waitHint;
     g_serviceStatus.dwControlsAccepted =
-        currentState == SERVICE_RUNNING ? SERVICE_ACCEPT_SESSIONCHANGE : 0;
+        currentState == SERVICE_RUNNING
+        ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE)
+        : 0;
 
     if (currentState == SERVICE_START_PENDING)
     {
@@ -1407,7 +1417,7 @@ std::wstring ResolveGuiExecutablePath()
     }
 
     std::wstring directoryPath = ExtractDirectory(modulePath);
-    return directoryPath + L"\\Antivirus.exe";
+    return directoryPath + L"\\" + antivirus::common::kGuiBinaryName;
 }
 
 bool FileExists(const std::wstring& path)
@@ -1634,7 +1644,7 @@ bool EnsureServiceInstalledAndConfigured(SC_HANDLE scmHandle, SC_HANDLE& service
         serviceHandle = CreateServiceW(
             scmHandle,
             antivirus::common::kServiceName,
-            antivirus::common::kServiceName,
+            antivirus::common::kServiceDisplayName,
             desiredAccess,
             SERVICE_WIN32_OWN_PROCESS,
             SERVICE_DEMAND_START,
@@ -2282,7 +2292,8 @@ DWORD WINAPI ServiceControlHandlerEx(
     {
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
-        return ERROR_CALL_NOT_IMPLEMENTED;
+        RequestConfirmedServiceStop();
+        return NO_ERROR;
     case SERVICE_CONTROL_INTERROGATE:
         ReportServiceStatus(g_serviceStatus.dwCurrentState, g_serviceStatus.dwWin32ExitCode, 0);
         return NO_ERROR;

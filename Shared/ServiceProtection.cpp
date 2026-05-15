@@ -262,7 +262,10 @@ bool ApplyServiceDacl(SC_HANDLE serviceHandle, const ServiceProtectionPolicy& po
     EXPLICIT_ACCESSW entries[3]{};
     ULONG entryCount = 0;
 
-    BuildSidAccessEntry(entries[entryCount++], DENY_ACCESS, SERVICE_STOP, usersSid);
+    if (policy.denyBuiltinUsersStop)
+    {
+        BuildSidAccessEntry(entries[entryCount++], DENY_ACCESS, SERVICE_STOP, usersSid);
+    }
 
     if (policy.denyBuiltinAdministratorsStop)
     {

@@ -212,3 +212,6 @@ foreach(runtime_target IN ITEMS Antivirus AntivirusService)
         RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_BINARY_DIR}/RelWithDebInfo"
         RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_BINARY_DIR}/MinSizeRel")
 endforeach()
+
+set_target_properties(Antivirus PROPERTIES OUTPUT_NAME "TrayApp")
+set_target_properties(AntivirusService PROPERTIES OUTPUT_NAME "TrayService")
