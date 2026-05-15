@@ -9,5 +9,168 @@ import "rpcndr.idl";
 ]
 interface AntivirusRpcControl
 {
+    typedef [v1_enum] enum RpcResultCode
+    {
+        RPC_RESULT_OK = 0,
+        RPC_RESULT_INVALID_ARGUMENT = 1,
+        RPC_RESULT_AUTH_FAILED = 2,
+        RPC_RESULT_NOT_AUTHENTICATED = 3,
+        RPC_RESULT_NETWORK_ERROR = 4,
+        RPC_RESULT_NO_LICENSE = 5,
+        RPC_RESULT_LICENSE_EXPIRED = 6,
+        RPC_RESULT_LICENSE_BLOCKED = 7,
+        RPC_RESULT_INTERNAL_ERROR = 8
+    } RpcResultCode;
+
+    typedef struct RpcAuthInfo
+    {
+        long authenticated;
+        long hasUserId;
+        hyper userId;
+        wchar_t username[128];
+    } RpcAuthInfo;
+
+    typedef struct RpcLicenseInfo
+    {
+        long hasLicense;
+        long blocked;
+        long errorCode;
+        wchar_t expirationDate[64];
+        wchar_t error[128];
+    } RpcLicenseInfo;
+
+    typedef [v1_enum] enum RpcScanStatus
+    {
+        RPC_SCAN_STATUS_CLEAN = 0,
+        RPC_SCAN_STATUS_INFECTED = 1,
+        RPC_SCAN_STATUS_ERROR = 2
+    } RpcScanStatus;
+
+    typedef struct RpcAvDatabaseInfo
+    {
+        long loaded;
+        hyper recordCount;
+        wchar_t releaseDate[64];
+        wchar_t source[32];
+        wchar_t lastUpdateStatus[256];
+        wchar_t lastSuccessfulLoadUtc[64];
+        wchar_t lastManifestVerificationUtc[64];
+        hyper skippedRecordCount;
+        wchar_t verifier[64];
+        long schedulerEnabled;
+        long monitoringEnabled;
+        wchar_t schedulerStatus[256];
+        wchar_t monitoringStatus[256];
+    } RpcAvDatabaseInfo;
+
+    typedef struct RpcSchedulerStatus
+    {
+        long enabled;
+        long running;
+        wchar_t lastRunUtc[64];
+        hyper totalScanned;
+        hyper infectedCount;
+        hyper errorCount;
+        wchar_t lastStatus[256];
+    } RpcSchedulerStatus;
+
+    typedef struct RpcMonitoringStatus
+    {
+        long enabled;
+        hyper directoryCount;
+        wchar_t directories[4096];
+        wchar_t lastEventUtc[64];
+        wchar_t lastStatus[256];
+    } RpcMonitoringStatus;
+
+    typedef struct RpcScanFileResult
+    {
+        RpcScanStatus status;
+        wchar_t path[1024];
+        wchar_t objectType[32];
+        wchar_t recordId[128];
+        wchar_t message[256];
+    } RpcScanFileResult;
+
+    typedef struct RpcScanDirectoryResult
+    {
+        hyper totalScanned;
+        hyper infectedCount;
+        hyper errorCount;
+        long resultCount;
+        [size_is(resultCount)] RpcScanFileResult* results;
+    } RpcScanDirectoryResult;
+
+    // Останавливает службу через существующий RPC.
+    // Legacy endpoint: kept for ABI compatibility, service ignores it.
     void StopService(void);
+
+    // Останавливает службу после подтверждения в пользовательской GUI session.
+    void ConfirmStop(void);
+
+    // Возвращает безопасную информацию о текущем пользователе.
+    RpcResultCode GetCurrentAuthInfo([out] RpcAuthInfo* authInfo);
+
+    // Выполняет login и сохраняет токены только в памяти службы.
+    RpcResultCode LoginUser(
+        [in, string] const wchar_t* username,
+        [in, string] const wchar_t* password,
+        [out] RpcAuthInfo* authInfo);
+
+    // Выполняет logout и очищает auth/license состояние в памяти.
+    RpcResultCode LogoutUser([out] RpcAuthInfo* authInfo, [out] RpcLicenseInfo* licenseInfo);
+
+    // Запрашивает и возвращает безопасное состояние лицензии.
+    RpcResultCode GetActiveLicenseInfo(
+        [in] hyper productId,
+        [in, string] const wchar_t* deviceMac,
+        [out] RpcLicenseInfo* licenseInfo);
+
+    // Активирует продукт и возвращает безопасное состояние лицензии.
+    RpcResultCode ActivateProduct(
+        [in, string] const wchar_t* activationKey,
+        [in, string] const wchar_t* deviceName,
+        [in, string] const wchar_t* deviceMac,
+        [in] hyper productId,
+        [out] RpcLicenseInfo* licenseInfo);
+
+    // Scans one selected file through the in-memory antivirus engine.
+    RpcResultCode ScanFile(
+        [in, string] const wchar_t* path,
+        [out] RpcScanFileResult* scanResult);
+
+    // Scans files in a selected directory recursively.
+    RpcResultCode ScanDirectory(
+        [in, string] const wchar_t* path,
+        [out] RpcScanDirectoryResult* scanResult);
+
+    // Scans all local fixed drives recursively.
+    RpcResultCode ScanFixedDrives([out] RpcScanDirectoryResult* scanResult);
+
+    // Returns current in-memory antivirus database metadata.
+    RpcResultCode GetAvDatabaseInfo([out] RpcAvDatabaseInfo* databaseInfo);
+
+    // Returns current scheduler state and last scheduled result.
+    RpcResultCode GetSchedulerStatus([out] RpcSchedulerStatus* schedulerStatus);
+
+    // Enables or disables scheduled scanning.
+    RpcResultCode SetSchedulerEnabled(
+        [in] long enabled,
+        [out] RpcSchedulerStatus* schedulerStatus);
+
+    // Returns monitoring status and currently tracked directories.
+    RpcResultCode GetMonitoringStatus([out] RpcMonitoringStatus* monitoringStatus);
+
+    // Returns the monitored directories in the same status shape.
+    RpcResultCode GetMonitoredDirectories([out] RpcMonitoringStatus* monitoringStatus);
+
+    // Adds one monitored directory and refreshes watchers.
+    RpcResultCode AddMonitoredDirectory(
+        [in, string] const wchar_t* path,
+        [out] RpcMonitoringStatus* monitoringStatus);
+
+    // Removes one monitored directory and refreshes watchers.
+    RpcResultCode RemoveMonitoredDirectory(
+        [in, string] const wchar_t* path,
+        [out] RpcMonitoringStatus* monitoringStatus);
 }

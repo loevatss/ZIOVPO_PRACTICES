@@ -201,7 +201,7 @@
       <ApplicationConfigurationMode>true</ApplicationConfigurationMode>
     </Midl>
     <Link>
-      <AdditionalDependencies>Advapi32.lib;Rpcrt4.lib;Wtsapi32.lib;Userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Advapi32.lib;Rpcrt4.lib;Wtsapi32.lib;Userenv.lib;Bcrypt.lib;Crypt32.lib;Winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Platform)'=='Win32'">
@@ -220,9 +220,23 @@
     </Midl>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="AntivirusDatabaseUpdater.h" />
+    <ClInclude Include="AntivirusEngineSelfTest.h" />
+    <ClInclude Include="AntivirusScanService.h" />
+    <ClInclude Include="..\Shared\AntivirusDatabaseStorage.h" />
+    <ClInclude Include="..\Shared\AntivirusEngine.h" />
+    <ClInclude Include="..\Shared\ProcessProtection.h" />
     <ClInclude Include="..\Shared\ServiceCommon.h" />
+    <ClInclude Include="..\Shared\ServiceProtection.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="AntivirusDatabaseUpdater.cpp" />
+    <ClCompile Include="AntivirusEngineSelfTest.cpp" />
+    <ClCompile Include="AntivirusScanService.cpp" />
+    <ClCompile Include="..\Shared\AntivirusDatabaseStorage.cpp" />
+    <ClCompile Include="..\Shared\AntivirusEngine.cpp" />
+    <ClCompile Include="..\Shared\ProcessProtection.cpp" />
+    <ClCompile Include="..\Shared\ServiceProtection.cpp" />
     <ClCompile Include="service.cpp" />
     <ClCompile Include="$(IntDir)Generated\AntivirusRpcControl_s.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
