@@ -7,6 +7,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+
     env:
       BUILD_CONFIGURATION: Release
       BUILD_PLATFORM: x64
@@ -22,19 +23,30 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+
       - name: Install WiX Toolset
         shell: pwsh
         run: |
           dotnet tool install --global wix --version ${env:WIX_VERSION}
+
           $wixToolDir = Join-Path $env:USERPROFILE '.dotnet\tools'
           $env:PATH = "$wixToolDir;$env:PATH"
           $wixToolDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
           & (Join-Path $wixToolDir 'wix.exe') --version
 
       - name: Build native Release x64
         shell: pwsh
         run: |
-          msbuild Antivirus.slnx /restore /t:Build /p:Configuration=${env:BUILD_CONFIGURATION} /p:Platform=${env:BUILD_PLATFORM}
+          msbuild.exe Antivirus.slnx `
+            /restore `
+            /t:Build `
+            /p:Configuration=${env:BUILD_CONFIGURATION} `
+            /p:Platform=${env:BUILD_PLATFORM}
 
       - name: Run TrayService self-test
         shell: pwsh
@@ -44,20 +56,32 @@ jobs:
       - name: Build MSI
         shell: pwsh
         run: |
-          msbuild Installer\TrayInstaller.wixproj /restore /t:Build /p:Configuration=${env:BUILD_CONFIGURATION} /p:Platform=${env:BUILD_PLATFORM} /p:InstallerVersion=${env:INSTALLER_VERSION}
+          msbuild.exe Installer\TrayInstaller.wixproj `
+            /restore `
+            /t:Build `
+            /p:Configuration=${env:BUILD_CONFIGURATION} `
+            /p:Platform=${env:BUILD_PLATFORM} `
+            /p:InstallerVersion=${env:INSTALLER_VERSION}
 
       - name: Build bundle
         shell: pwsh
         run: |
-          msbuild Installer\TrayBundle.wixproj /restore /t:Build /p:Configuration=${env:BUILD_CONFIGURATION} /p:Platform=${env:BUILD_PLATFORM} /p:InstallerVersion=${env:INSTALLER_VERSION}
+          msbuild.exe Installer\TrayBundle.wixproj `
+            /restore `
+            /t:Build `
+            /p:Configuration=${env:BUILD_CONFIGURATION} `
+            /p:Platform=${env:BUILD_PLATFORM} `
+            /p:InstallerVersion=${env:INSTALLER_VERSION}
 
       - name: Validate outputs and prepare artifacts
         shell: pwsh
         run: |
           $rawAppArtifactDir = Join-Path $PWD 'ci-artifacts\app'
           $installerArtifactDir = Join-Path $PWD 'ci-artifacts\installer'
+
           Remove-Item -LiteralPath $rawAppArtifactDir -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item -LiteralPath $installerArtifactDir -Recurse -Force -ErrorAction SilentlyContinue
+
           New-Item -ItemType Directory -Path $rawAppArtifactDir -Force | Out-Null
           New-Item -ItemType Directory -Path $installerArtifactDir -Force | Out-Null
 
@@ -75,20 +99,26 @@ jobs:
 
           $builtHash = (Get-FileHash $trayService -Algorithm SHA256).Hash
           $stagedHash = (Get-FileHash $stagedTrayService -Algorithm SHA256).Hash
+
           if ($builtHash -ne $stagedHash) {
             throw "Installer staging does not contain the fresh TrayService.exe. Built=$builtHash Staged=$stagedHash"
           }
 
           Copy-Item $trayApp $rawAppArtifactDir -Force
           Copy-Item $trayService $rawAppArtifactDir -Force
-
           Copy-Item $msi $installerArtifactDir -Force
           Copy-Item $bundle $installerArtifactDir -Force
           Copy-Item 'Installer/README.md' (Join-Path $installerArtifactDir 'README.md') -Force
 
           $installerFiles = Get-ChildItem $installerArtifactDir -File
-          $expectedInstallerFiles = @('README.md', 'ZIOVPOAntivirus.msi', 'ZIOVPOAntivirusSetup.exe') | Sort-Object
+          $expectedInstallerFiles = @(
+            'README.md',
+            'ZIOVPOAntivirus.msi',
+            'ZIOVPOAntivirusSetup.exe'
+          ) | Sort-Object
+
           $actualInstallerFiles = $installerFiles.Name | Sort-Object
+
           if (@(Compare-Object -ReferenceObject $expectedInstallerFiles -DifferenceObject $actualInstallerFiles).Count -ne 0) {
             throw "Installer artifact contains unexpected files: $($actualInstallerFiles -join ', ')"
           }
