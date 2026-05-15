@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -17,7 +18,9 @@
 #include <vector>
 
 #include "AntivirusRpcControl.h"
+#include "ProcessProtection.h"
 #include "ServiceCommon.h"
+#include "ServiceProtection.h"
 #include "WebApiIntegration.h"
 
 namespace
@@ -33,12 +36,17 @@ SERVICE_STATUS g_serviceStatus{};
 volatile LONG g_rpcStopRequested = 0;
 constexpr DWORD kServiceStartTimeoutMs = 30000;
 constexpr DWORD kServiceStatusPollIntervalMs = 250;
+constexpr DWORD kGuiSessionMonitorIntervalMs = 15000;
+constexpr bool kDenyAdministratorsProcessTerminate = true;
+constexpr bool kDenyAdministratorsServiceStop = true;
 
 std::mutex g_guiProcessesMutex;
 std::unordered_map<DWORD, GuiProcessInfo> g_guiProcessesBySession;
 std::wstring g_guiExecutablePath;
+std::thread g_guiSessionMonitorThread;
+std::atomic<bool> g_guiSessionMonitorStopRequested = false;
 antivirus::web::InMemorySession g_webSession;
-antivirus::web::ApiClient g_webApiClient(L"https://192.168.1.56:8443/");
+antivirus::web::ApiClient g_webApiClient(L"https://10.11.134.140:8443/");
 std::mutex g_webStateMutex;
 std::thread g_webWorkerThread;
 std::atomic<bool> g_webWorkerStopRequested = false;
@@ -478,6 +486,43 @@ DWORD RpcStatusToWin32(RPC_STATUS status)
     return status == RPC_S_OK ? NO_ERROR : static_cast<DWORD>(status);
 }
 
+void DebugLogService(const wchar_t* format, ...)
+{
+    wchar_t message[1024]{};
+    va_list args;
+    va_start(args, format);
+    vswprintf_s(message, format, args);
+    va_end(args);
+
+    wchar_t buffer[1152]{};
+    swprintf_s(buffer, L"[AntivirusService] %ls\r\n", message);
+    OutputDebugStringW(buffer);
+}
+
+// Пишет диагностическое сообщение службы в OutputDebugStringW.
+void DebugLogServiceProtection(const wchar_t* message)
+{
+    DebugLogService(L"%ls", message);
+}
+
+// Применяет user-mode защиту к process object службы и к service object.
+void HardenRunningServiceObjects()
+{
+    antivirus::protection::ProcessProtectionPolicy processPolicy{};
+    processPolicy.denyBuiltinAdministratorsTerminate = kDenyAdministratorsProcessTerminate;
+    if (!antivirus::protection::HardenCurrentProcess(processPolicy))
+    {
+        DebugLogServiceProtection(L"service process hardening failed; service keeps running");
+    }
+
+    antivirus::protection::ServiceProtectionPolicy servicePolicy{};
+    servicePolicy.denyBuiltinAdministratorsStop = kDenyAdministratorsServiceStop;
+    if (!antivirus::protection::HardenServiceObject(antivirus::common::kServiceName, servicePolicy))
+    {
+        DebugLogServiceProtection(L"service object hardening failed; service keeps running");
+    }
+}
+
 void ReportServiceStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint)
 {
     static DWORD checkpoint = 1;
@@ -532,6 +577,113 @@ bool FileExists(const std::wstring& path)
     const DWORD attributes = GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES
         && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+const wchar_t* SessionStateName(WTS_CONNECTSTATE_CLASS state)
+{
+    switch (state)
+    {
+    case WTSActive:
+        return L"WTSActive";
+    case WTSConnected:
+        return L"WTSConnected";
+    case WTSConnectQuery:
+        return L"WTSConnectQuery";
+    case WTSShadow:
+        return L"WTSShadow";
+    case WTSDisconnected:
+        return L"WTSDisconnected";
+    case WTSIdle:
+        return L"WTSIdle";
+    case WTSListen:
+        return L"WTSListen";
+    case WTSReset:
+        return L"WTSReset";
+    case WTSDown:
+        return L"WTSDown";
+    case WTSInit:
+        return L"WTSInit";
+    default:
+        return L"Unknown";
+    }
+}
+
+const wchar_t* SessionChangeEventName(DWORD eventType)
+{
+    switch (eventType)
+    {
+    case WTS_CONSOLE_CONNECT:
+        return L"WTS_CONSOLE_CONNECT";
+    case WTS_CONSOLE_DISCONNECT:
+        return L"WTS_CONSOLE_DISCONNECT";
+    case WTS_REMOTE_CONNECT:
+        return L"WTS_REMOTE_CONNECT";
+    case WTS_REMOTE_DISCONNECT:
+        return L"WTS_REMOTE_DISCONNECT";
+    case WTS_SESSION_LOGON:
+        return L"WTS_SESSION_LOGON";
+    case WTS_SESSION_LOGOFF:
+        return L"WTS_SESSION_LOGOFF";
+    case WTS_SESSION_LOCK:
+        return L"WTS_SESSION_LOCK";
+    case WTS_SESSION_UNLOCK:
+        return L"WTS_SESSION_UNLOCK";
+    case WTS_SESSION_REMOTE_CONTROL:
+        return L"WTS_SESSION_REMOTE_CONTROL";
+    case WTS_SESSION_CREATE:
+        return L"WTS_SESSION_CREATE";
+    case WTS_SESSION_TERMINATE:
+        return L"WTS_SESSION_TERMINATE";
+    default:
+        return L"Unknown";
+    }
+}
+
+bool IsInteractiveSessionState(WTS_CONNECTSTATE_CLASS state)
+{
+    return state == WTSActive || state == WTSConnected;
+}
+
+bool QuerySessionState(DWORD sessionId, WTS_CONNECTSTATE_CLASS& state)
+{
+    LPWSTR stateBuffer = nullptr;
+    DWORD bytesReturned = 0;
+    if (!WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            sessionId,
+            WTSConnectState,
+            &stateBuffer,
+            &bytesReturned))
+    {
+        const DWORD error = GetLastError();
+        DebugLogService(
+            L"QuerySessionState: session=%lu WTSQuerySessionInformationW failed, error=%lu",
+            sessionId,
+            error);
+        return false;
+    }
+
+    if (stateBuffer == nullptr || bytesReturned < sizeof(WTS_CONNECTSTATE_CLASS))
+    {
+        DebugLogService(
+            L"QuerySessionState: session=%lu returned invalid WTSConnectState buffer, bytes=%lu",
+            sessionId,
+            bytesReturned);
+        if (stateBuffer != nullptr)
+        {
+            WTSFreeMemory(stateBuffer);
+        }
+        return false;
+    }
+
+    state = *reinterpret_cast<WTS_CONNECTSTATE_CLASS*>(stateBuffer);
+    WTSFreeMemory(stateBuffer);
+
+    DebugLogService(
+        L"QuerySessionState: session=%lu state=%ls",
+        sessionId,
+        SessionStateName(state));
+    return true;
 }
 
 std::wstring QuotePathForScm(const std::wstring& path)
@@ -805,6 +957,18 @@ void CleanupExitedGuiProcessesLocked()
 {
     for (auto it = g_guiProcessesBySession.begin(); it != g_guiProcessesBySession.end();)
     {
+        const DWORD sessionId = it->first;
+        const DWORD processId = it->second.processId;
+        if (it->second.processHandle == nullptr)
+        {
+            DebugLogService(
+                L"CleanupExitedGuiProcessesLocked: session=%lu pid=%lu has null process handle; removing",
+                sessionId,
+                processId);
+            it = g_guiProcessesBySession.erase(it);
+            continue;
+        }
+
         const DWORD waitResult = WaitForSingleObject(it->second.processHandle, 0);
         if (waitResult == WAIT_TIMEOUT)
         {
@@ -812,6 +976,11 @@ void CleanupExitedGuiProcessesLocked()
             continue;
         }
 
+        DebugLogService(
+            L"CleanupExitedGuiProcessesLocked: session=%lu pid=%lu is not alive, wait=%lu; removing",
+            sessionId,
+            processId,
+            waitResult);
         CloseHandle(it->second.processHandle);
         it = g_guiProcessesBySession.erase(it);
     }
@@ -822,15 +991,37 @@ bool IsGuiRunningInSessionLocked(DWORD sessionId)
     auto it = g_guiProcessesBySession.find(sessionId);
     if (it == g_guiProcessesBySession.end())
     {
+        DebugLogService(
+            L"IsGuiRunningInSessionLocked: session=%lu has no tracked GUI process",
+            sessionId);
+        return false;
+    }
+
+    if (it->second.processHandle == nullptr)
+    {
+        DebugLogService(
+            L"IsGuiRunningInSessionLocked: session=%lu pid=%lu has null process handle; removing",
+            sessionId,
+            it->second.processId);
+        g_guiProcessesBySession.erase(it);
         return false;
     }
 
     const DWORD waitResult = WaitForSingleObject(it->second.processHandle, 0);
     if (waitResult == WAIT_TIMEOUT)
     {
+        DebugLogService(
+            L"IsGuiRunningInSessionLocked: session=%lu pid=%lu is alive",
+            sessionId,
+            it->second.processId);
         return true;
     }
 
+    DebugLogService(
+        L"IsGuiRunningInSessionLocked: session=%lu pid=%lu is dead, wait=%lu; removing",
+        sessionId,
+        it->second.processId,
+        waitResult);
     CloseHandle(it->second.processHandle);
     g_guiProcessesBySession.erase(it);
     return false;
@@ -850,10 +1041,18 @@ bool TrackGuiProcess(DWORD sessionId, DWORD processId, HANDLE processHandle)
 
     if (IsGuiRunningInSessionLocked(sessionId))
     {
+        DebugLogService(
+            L"TrackGuiProcess: session=%lu pid=%lu not tracked because another GUI is alive",
+            sessionId,
+            processId);
         return false;
     }
 
     g_guiProcessesBySession[sessionId] = { processId, processHandle };
+    DebugLogService(
+        L"TrackGuiProcess: session=%lu pid=%lu tracked",
+        sessionId,
+        processId);
     return true;
 }
 
@@ -864,31 +1063,46 @@ std::wstring BuildGuiCommandLine(const std::wstring& executablePath)
 
 bool LaunchGuiInSession(DWORD sessionId)
 {
+    DebugLogService(L"LaunchGuiInSession: session=%lu start", sessionId);
+
     if (sessionId == 0)
     {
+        DebugLogService(L"LaunchGuiInSession: session=%lu skipped because Session 0 is not interactive", sessionId);
         return false;
     }
 
     if (InterlockedCompareExchange(&g_rpcStopRequested, 0, 0) != 0)
     {
+        DebugLogService(L"LaunchGuiInSession: session=%lu skipped because service stop is requested", sessionId);
         return false;
     }
 
     if (g_guiExecutablePath.empty() || !FileExists(g_guiExecutablePath))
     {
+        DebugLogService(
+            L"LaunchGuiInSession: session=%lu skipped because GUI path is missing: %ls",
+            sessionId,
+            g_guiExecutablePath.empty() ? L"(empty)" : g_guiExecutablePath.c_str());
         return false;
     }
 
     if (IsGuiRunningInSession(sessionId))
     {
+        DebugLogService(L"LaunchGuiInSession: session=%lu skipped because tracked GUI is alive", sessionId);
         return true;
     }
 
     HANDLE userToken = nullptr;
     if (!WTSQueryUserToken(sessionId, &userToken))
     {
+        const DWORD error = GetLastError();
+        DebugLogService(
+            L"LaunchGuiInSession: session=%lu WTSQueryUserToken failed, error=%lu",
+            sessionId,
+            error);
         return false;
     }
+    DebugLogService(L"LaunchGuiInSession: session=%lu WTSQueryUserToken succeeded", sessionId);
 
     HANDLE primaryToken = nullptr;
     const bool tokenDuplicated = DuplicateTokenEx(
@@ -898,15 +1112,27 @@ bool LaunchGuiInSession(DWORD sessionId)
         SecurityImpersonation,
         TokenPrimary,
         &primaryToken) != FALSE;
+    const DWORD duplicateError = tokenDuplicated ? NO_ERROR : GetLastError();
     CloseHandle(userToken);
 
     if (!tokenDuplicated)
     {
+        DebugLogService(
+            L"LaunchGuiInSession: session=%lu DuplicateTokenEx failed, error=%lu",
+            sessionId,
+            duplicateError);
         return false;
     }
+    DebugLogService(L"LaunchGuiInSession: session=%lu DuplicateTokenEx succeeded", sessionId);
 
     LPVOID environmentBlock = nullptr;
     const bool envCreated = CreateEnvironmentBlock(&environmentBlock, primaryToken, FALSE) != FALSE;
+    const DWORD environmentError = envCreated ? NO_ERROR : GetLastError();
+    DebugLogService(
+        L"LaunchGuiInSession: session=%lu CreateEnvironmentBlock %ls, error=%lu",
+        sessionId,
+        envCreated ? L"succeeded" : L"failed",
+        environmentError);
 
     STARTUPINFOW startupInfo{};
     startupInfo.cb = sizeof(startupInfo);
@@ -933,6 +1159,15 @@ bool LaunchGuiInSession(DWORD sessionId)
         workingDirectory.c_str(),
         &startupInfo,
         &processInfo) != FALSE;
+    const DWORD createProcessError = processCreated ? NO_ERROR : GetLastError();
+
+    DebugLogService(
+        L"LaunchGuiInSession: session=%lu CreateProcessAsUserW %ls, error=%lu, pid=%lu, desktop=%ls",
+        sessionId,
+        processCreated ? L"succeeded" : L"failed",
+        createProcessError,
+        processCreated ? processInfo.dwProcessId : 0,
+        startupInfo.lpDesktop);
 
     if (envCreated)
     {
@@ -948,14 +1183,113 @@ bool LaunchGuiInSession(DWORD sessionId)
 
     CloseHandle(processInfo.hThread);
 
-    if (!TrackGuiProcess(sessionId, processInfo.dwProcessId, processInfo.hProcess))
+    antivirus::protection::ProcessProtectionPolicy guiProtectionPolicy{};
+    guiProtectionPolicy.denyBuiltinAdministratorsTerminate = kDenyAdministratorsProcessTerminate;
+    if (!antivirus::protection::HardenProcessHandle(
+        processInfo.hProcess,
+        processInfo.dwProcessId,
+        guiProtectionPolicy))
     {
+        DebugLogServiceProtection(L"GUI process hardening failed; terminating only the GUI process");
         TerminateProcess(processInfo.hProcess, 0);
         WaitForSingleObject(processInfo.hProcess, 5000);
         CloseHandle(processInfo.hProcess);
+        return false;
     }
 
+    if (!TrackGuiProcess(sessionId, processInfo.dwProcessId, processInfo.hProcess))
+    {
+        DebugLogService(
+            L"LaunchGuiInSession: session=%lu pid=%lu terminating duplicate GUI created during race",
+            sessionId,
+            processInfo.dwProcessId);
+        TerminateProcess(processInfo.hProcess, 0);
+        WaitForSingleObject(processInfo.hProcess, 5000);
+        CloseHandle(processInfo.hProcess);
+        return true;
+    }
+
+    DebugLogService(
+        L"LaunchGuiInSession: session=%lu end, launched pid=%lu",
+        sessionId,
+        processInfo.dwProcessId);
     return true;
+}
+
+bool EnsureTrayAppForSession(DWORD sessionId)
+{
+    DebugLogService(L"EnsureTrayAppForSession: session=%lu start", sessionId);
+
+    if (sessionId == 0)
+    {
+        DebugLogService(L"EnsureTrayAppForSession: session=%lu skipped because Session 0 is not interactive", sessionId);
+        return false;
+    }
+
+    WTS_CONNECTSTATE_CLASS sessionState = WTSDown;
+    if (!QuerySessionState(sessionId, sessionState))
+    {
+        DebugLogService(L"EnsureTrayAppForSession: session=%lu end, session state unavailable", sessionId);
+        return false;
+    }
+
+    if (!IsInteractiveSessionState(sessionState))
+    {
+        DebugLogService(
+            L"EnsureTrayAppForSession: session=%lu skipped because state=%ls is not interactive",
+            sessionId,
+            SessionStateName(sessionState));
+        return false;
+    }
+
+    if (IsGuiRunningInSession(sessionId))
+    {
+        DebugLogService(L"EnsureTrayAppForSession: session=%lu end, GUI already alive", sessionId);
+        return true;
+    }
+
+    const bool launched = LaunchGuiInSession(sessionId);
+    DebugLogService(
+        L"EnsureTrayAppForSession: session=%lu end, launched=%ls",
+        sessionId,
+        launched ? L"true" : L"false");
+    return launched;
+}
+
+void OnSessionLogoff(DWORD sessionId)
+{
+    DebugLogService(L"OnSessionLogoff: session=%lu start", sessionId);
+
+    std::lock_guard<std::mutex> guard(g_guiProcessesMutex);
+    auto it = g_guiProcessesBySession.find(sessionId);
+    if (it == g_guiProcessesBySession.end())
+    {
+        DebugLogService(L"OnSessionLogoff: session=%lu no tracked GUI process to clean up", sessionId);
+        return;
+    }
+
+    const DWORD processId = it->second.processId;
+    if (it->second.processHandle != nullptr)
+    {
+        const DWORD waitResult = WaitForSingleObject(it->second.processHandle, 0);
+        DebugLogService(
+            L"OnSessionLogoff: session=%lu pid=%lu cleanup, old process %ls, wait=%lu",
+            sessionId,
+            processId,
+            waitResult == WAIT_TIMEOUT ? L"alive" : L"dead/signaled",
+            waitResult);
+        CloseHandle(it->second.processHandle);
+    }
+    else
+    {
+        DebugLogService(
+            L"OnSessionLogoff: session=%lu pid=%lu cleanup had null process handle",
+            sessionId,
+            processId);
+    }
+
+    g_guiProcessesBySession.erase(it);
+    DebugLogService(L"OnSessionLogoff: session=%lu end, tracking removed", sessionId);
 }
 
 void LaunchGuiInAllUserSessions()
@@ -965,21 +1299,77 @@ void LaunchGuiInAllUserSessions()
 
     if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &sessionCount))
     {
+        const DWORD error = GetLastError();
+        DebugLogService(
+            L"LaunchGuiInAllUserSessions: WTSEnumerateSessionsW failed, error=%lu",
+            error);
         return;
     }
+
+    DebugLogService(
+        L"LaunchGuiInAllUserSessions: scanning %lu sessions",
+        sessionCount);
 
     for (DWORD i = 0; i < sessionCount; ++i)
     {
         const DWORD sessionId = sessions[i].SessionId;
         if (sessionId == 0)
         {
+            DebugLogService(L"LaunchGuiInAllUserSessions: session=0 skipped");
             continue;
         }
 
-        LaunchGuiInSession(sessionId);
+        if (!IsInteractiveSessionState(sessions[i].State))
+        {
+            DebugLogService(
+                L"LaunchGuiInAllUserSessions: session=%lu skipped because state=%ls",
+                sessionId,
+                SessionStateName(sessions[i].State));
+            continue;
+        }
+
+        EnsureTrayAppForSession(sessionId);
     }
 
     WTSFreeMemory(sessions);
+}
+
+void GuiSessionMonitorLoop()
+{
+    DebugLogService(L"GuiSessionMonitorLoop: started");
+
+    while (!g_guiSessionMonitorStopRequested.load())
+    {
+        LaunchGuiInAllUserSessions();
+
+        DWORD sleptMs = 0;
+        while (sleptMs < kGuiSessionMonitorIntervalMs
+            && !g_guiSessionMonitorStopRequested.load())
+        {
+            const DWORD sleepMs = std::min<DWORD>(
+                kServiceStatusPollIntervalMs,
+                kGuiSessionMonitorIntervalMs - sleptMs);
+            Sleep(sleepMs);
+            sleptMs += sleepMs;
+        }
+    }
+
+    DebugLogService(L"GuiSessionMonitorLoop: stopped");
+}
+
+void StartGuiSessionMonitor()
+{
+    g_guiSessionMonitorStopRequested.store(false);
+    g_guiSessionMonitorThread = std::thread(GuiSessionMonitorLoop);
+}
+
+void StopGuiSessionMonitor()
+{
+    g_guiSessionMonitorStopRequested.store(true);
+    if (g_guiSessionMonitorThread.joinable())
+    {
+        g_guiSessionMonitorThread.join();
+    }
 }
 
 void StopTrackedGuiProcesses()
@@ -1060,10 +1450,39 @@ DWORD WINAPI ServiceControlHandlerEx(
         return NO_ERROR;
     case SERVICE_CONTROL_SESSIONCHANGE:
     {
-        if (eventType == WTS_SESSION_LOGON && eventData != nullptr)
+        DWORD sessionId = 0;
+        if (eventData != nullptr)
         {
             const auto* notification = static_cast<WTSSESSION_NOTIFICATION*>(eventData);
-            LaunchGuiInSession(notification->dwSessionId);
+            sessionId = notification->dwSessionId;
+        }
+
+        DebugLogService(
+            L"ServiceControlHandlerEx: session change event=%ls(%lu), session=%lu",
+            SessionChangeEventName(eventType),
+            eventType,
+            sessionId);
+
+        if (eventData == nullptr)
+        {
+            DebugLogService(L"ServiceControlHandlerEx: session change skipped because eventData is null");
+            return NO_ERROR;
+        }
+
+        switch (eventType)
+        {
+        case WTS_SESSION_LOGON:
+        case WTS_SESSION_UNLOCK:
+        case WTS_CONSOLE_CONNECT:
+        case WTS_REMOTE_CONNECT:
+            EnsureTrayAppForSession(sessionId);
+            break;
+        case WTS_SESSION_LOGOFF:
+        case WTS_SESSION_TERMINATE:
+            OnSessionLogoff(sessionId);
+            break;
+        default:
+            break;
         }
 
         return NO_ERROR;
@@ -1107,16 +1526,20 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
     }
 
     ReportServiceStatus(SERVICE_RUNNING, NO_ERROR, 0);
+    HardenRunningServiceObjects();
     LaunchGuiInAllUserSessions();
+    StartGuiSessionMonitor();
 
     RPC_STATUS waitStatus = RpcMgmtWaitServerListen();
     if (waitStatus != RPC_S_OK && waitStatus != RPC_S_NOT_LISTENING)
     {
+        StopGuiSessionMonitor();
         ShutdownWebApiLayer();
         ReportServiceStatus(SERVICE_STOPPED, RpcStatusToWin32(waitStatus), 0);
         return;
     }
 
+    StopGuiSessionMonitor();
     StopTrackedGuiProcesses();
     ShutdownWebApiLayer();
     RpcServerUnregisterIf(AntivirusRpcControl_v1_0_s_ifspec, nullptr, FALSE);
@@ -1124,14 +1547,27 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
 }
 } // namespace
 
-extern "C" void StopService(void)
+// Запрашивает штатную остановку RPC listener и service main loop.
+void RequestConfirmedServiceStop()
 {
     if (InterlockedExchange(&g_rpcStopRequested, 1) != 0)
     {
         return;
     }
 
+    ReportServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
     RpcMgmtStopServerListening(nullptr);
+}
+
+extern "C" void StopService(void)
+{
+    DebugLogServiceProtection(L"legacy StopService RPC ignored; use ConfirmStop after GUI confirmation");
+}
+
+// Останавливает службу после подтверждения в пользовательской GUI session.
+extern "C" void ConfirmStop(void)
+{
+    RequestConfirmedServiceStop();
 }
 
 // Returns safe information about the current authenticated user.

@@ -220,9 +220,13 @@
     </Midl>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="..\Shared\ProcessProtection.h" />
     <ClInclude Include="..\Shared\ServiceCommon.h" />
+    <ClInclude Include="..\Shared\ServiceProtection.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="..\Shared\ProcessProtection.cpp" />
+    <ClCompile Include="..\Shared\ServiceProtection.cpp" />
     <ClCompile Include="service.cpp" />
     <ClCompile Include="$(IntDir)Generated\AntivirusRpcControl_s.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
