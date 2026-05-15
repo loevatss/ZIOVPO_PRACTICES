@@ -14,12 +14,15 @@
 #include <cwctype>
 #include <filesystem>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include "AntivirusDatabaseUpdater.h"
 #include "AntivirusEngine.h"
 #include "AntivirusEngineSelfTest.h"
 #include "AntivirusScanService.h"
@@ -35,6 +38,31 @@ struct GuiProcessInfo
 {
     DWORD processId = 0;
     HANDLE processHandle = nullptr;
+};
+
+struct DirectoryMonitorState
+{
+    std::filesystem::path path;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    std::thread thread;
+    std::atomic<bool> stopRequested = false;
+};
+
+struct ScheduledScanState
+{
+    bool enabled = true;
+    bool running = false;
+    std::string lastRunUtc;
+    std::string lastStatus = "idle";
+    antivirus::service::DirectoryScanResult lastResult;
+};
+
+struct MonitoringRuntimeState
+{
+    bool enabled = true;
+    std::vector<std::filesystem::path> directories;
+    std::string lastEventUtc;
+    std::string lastStatus = "idle";
 };
 
 SERVICE_STATUS_HANDLE g_serviceStatusHandle = nullptr;
@@ -57,10 +85,28 @@ antivirus::web::ApiClient g_webApiClient(L"https://192.168.1.56:8443/");
 antivirus::engine::AvSignatureDatabase g_avSignatureDatabase;
 std::mutex g_avDatabaseMutex;
 bool g_avDatabaseLoaded = false;
+std::string g_avDatabaseSourceName = "none";
+std::string g_avLastUpdateStatus = "not started";
+std::string g_avLastSuccessfulLoadUtc;
+std::string g_avLastSuccessfulManifestVerificationUtc;
+size_t g_avSkippedRecordCount = 0;
+std::string g_avVerifierName = "DEMO-HMAC-SHA256";
+std::atomic<bool> g_forceDatabaseUpdateRequested = false;
+std::mutex g_avMaintenanceMutex;
+std::vector<std::array<uint8_t, 16>> g_pendingDatabaseRepairIds;
 std::mutex g_webStateMutex;
 std::thread g_webWorkerThread;
 std::atomic<bool> g_webWorkerStopRequested = false;
 bool g_antivirusBackgroundTasksRunning = false;
+std::thread g_antivirusWorkerThread;
+std::atomic<bool> g_antivirusWorkerStopRequested = false;
+std::vector<std::unique_ptr<DirectoryMonitorState>> g_directoryMonitors;
+std::mutex g_directoryMonitorsMutex;
+std::mutex g_schedulerMutex;
+ScheduledScanState g_scheduledScanState;
+std::mutex g_monitoringMutex;
+MonitoringRuntimeState g_monitoringState;
+std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> g_monitoringDebounceByPath;
 std::string g_authenticatedUsername;
 
 struct LicenseRequestContext
@@ -72,6 +118,10 @@ struct LicenseRequestContext
 
 LicenseRequestContext g_licenseRequestContext;
 constexpr DWORD kWebWorkerPollIntervalMs = 1000;
+constexpr DWORD kAntivirusWorkerPollIntervalMs = 1000;
+constexpr auto kDatabaseUpdateInterval = std::chrono::minutes(15);
+constexpr auto kScheduledScanInterval = std::chrono::hours(12);
+constexpr auto kMonitorDebounceInterval = std::chrono::seconds(2);
 
 // Converts UTF-16 text to UTF-8 for HTTP API calls.
 std::string ToUtf8(const wchar_t* text)
@@ -111,6 +161,87 @@ std::wstring ToWide(const std::string& text)
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), size);
     wide.resize(static_cast<size_t>(size - 1));
     return wide;
+}
+
+// Returns current UTC time as an ISO-8601 text used in runtime diagnostics.
+std::string BuildCurrentUtcTimestamp()
+{
+    return antivirus::engine::BuildCurrentUtcReleaseDate();
+}
+
+// Reads one process environment variable as UTF-8.
+std::string ReadEnvironmentVariableUtf8(const wchar_t* name)
+{
+    if (name == nullptr || *name == L'\0')
+    {
+        return {};
+    }
+
+    DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required == 0)
+    {
+        return {};
+    }
+
+    std::vector<wchar_t> buffer(required, L'\0');
+    if (GetEnvironmentVariableW(name, buffer.data(), required) == 0)
+    {
+        return {};
+    }
+
+    return ToUtf8(buffer.data());
+}
+
+// Copies the current in-memory antivirus database so long scans do not hold the mutex.
+bool SnapshotAntivirusDatabase(antivirus::engine::AvSignatureDatabase* database)
+{
+    if (database == nullptr)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    if (!g_avDatabaseLoaded)
+    {
+        return false;
+    }
+
+    *database = g_avSignatureDatabase;
+    return true;
+}
+
+// Replaces global in-memory database state after startup load/update/rollback.
+void UpdateLoadedDatabaseState(
+    const antivirus::engine::AvSignatureDatabase& database,
+    bool loaded,
+    const std::string& sourceName,
+    const std::string& lastUpdateStatus,
+    size_t skippedRecordCount = 0,
+    const std::string& verifierName = "DEMO-HMAC-SHA256")
+{
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    g_avSignatureDatabase = database;
+    g_avDatabaseLoaded = loaded;
+    g_avDatabaseSourceName = sourceName;
+    g_avLastUpdateStatus = lastUpdateStatus;
+    g_avSkippedRecordCount = skippedRecordCount;
+    g_avVerifierName = verifierName;
+    if (loaded)
+    {
+        g_avLastSuccessfulLoadUtc = BuildCurrentUtcTimestamp();
+        g_avLastSuccessfulManifestVerificationUtc = g_avLastSuccessfulLoadUtc;
+    }
+}
+
+// Builds updater parameters from the current API session and ProgramData paths.
+std::optional<antivirus::service::AvDatabaseUpdaterContext> BuildDatabaseUpdaterContext()
+{
+    const antivirus::web::AuthTokens tokens = g_webSession.GetAuthTokens();
+    antivirus::service::AvDatabaseUpdaterContext context;
+    context.apiBaseUrl = g_webApiClient.GetBaseUrl();
+    context.accessToken = tokens.accessToken;
+    context.paths = antivirus::storage::ResolveDefaultDatabasePaths();
+    return context;
 }
 
 // Copies UTF-8 text into a fixed RPC wide-char buffer.
@@ -504,6 +635,59 @@ void FillRpcAvDatabaseInfo(
     target->loaded = source.loaded ? 1 : 0;
     target->recordCount = static_cast<hyper>(source.databaseInfo.recordCount);
     CopyUtf8ToRpcBuffer(source.databaseInfo.releaseDateUtc, target->releaseDate);
+    CopyUtf8ToRpcBuffer(source.sourceName, target->source);
+    CopyUtf8ToRpcBuffer(source.lastUpdateStatus, target->lastUpdateStatus);
+    CopyUtf8ToRpcBuffer(source.lastSuccessfulLoadUtc, target->lastSuccessfulLoadUtc);
+    CopyUtf8ToRpcBuffer(source.lastSuccessfulManifestVerificationUtc, target->lastManifestVerificationUtc);
+    target->skippedRecordCount = static_cast<hyper>(source.skippedRecordCount);
+    CopyUtf8ToRpcBuffer(source.verifierName, target->verifier);
+    target->schedulerEnabled = source.schedulerEnabled ? 1 : 0;
+    target->monitoringEnabled = source.monitoringEnabled ? 1 : 0;
+    CopyUtf8ToRpcBuffer(source.schedulerStatus, target->schedulerStatus);
+    CopyUtf8ToRpcBuffer(source.monitoringStatus, target->monitoringStatus);
+}
+
+void FillRpcSchedulerStatus(RpcSchedulerStatus* target)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+
+    *target = RpcSchedulerStatus{};
+    std::lock_guard<std::mutex> guard(g_schedulerMutex);
+    target->enabled = g_scheduledScanState.enabled ? 1 : 0;
+    target->running = g_scheduledScanState.running ? 1 : 0;
+    target->totalScanned = static_cast<hyper>(g_scheduledScanState.lastResult.totalScanned);
+    target->infectedCount = static_cast<hyper>(g_scheduledScanState.lastResult.infectedCount);
+    target->errorCount = static_cast<hyper>(g_scheduledScanState.lastResult.errorCount);
+    CopyUtf8ToRpcBuffer(g_scheduledScanState.lastRunUtc, target->lastRunUtc);
+    CopyUtf8ToRpcBuffer(g_scheduledScanState.lastStatus, target->lastStatus);
+}
+
+void FillRpcMonitoringStatus(RpcMonitoringStatus* target)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+
+    *target = RpcMonitoringStatus{};
+    std::lock_guard<std::mutex> guard(g_monitoringMutex);
+    target->enabled = g_monitoringState.enabled ? 1 : 0;
+    target->directoryCount = static_cast<hyper>(g_monitoringState.directories.size());
+    std::wstringstream directories;
+    for (size_t i = 0; i < g_monitoringState.directories.size(); ++i)
+    {
+        if (i != 0)
+        {
+            directories << L"; ";
+        }
+        directories << g_monitoringState.directories[i].wstring();
+    }
+    CopyWideToRpcBuffer(directories.str(), target->directories);
+    CopyUtf8ToRpcBuffer(g_monitoringState.lastEventUtc, target->lastEventUtc);
+    CopyUtf8ToRpcBuffer(g_monitoringState.lastStatus, target->lastStatus);
 }
 
 // Periodically refreshes tokens and license ticket in memory.
@@ -627,18 +811,39 @@ void DebugLogService(const wchar_t* format, ...)
     OutputDebugStringW(buffer);
 }
 
-// Loads demo antivirus signatures into the service process memory.
+// Loads signed antivirus signatures into the service process memory.
 void InitializeAntivirusEngineLayer()
 {
-    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
-    g_avDatabaseLoaded = antivirus::service::LoadServiceAntivirusDatabase(g_avSignatureDatabase);
+    antivirus::storage::AvDatabaseLoadResult loadResult;
+    antivirus::engine::AvSignatureDatabase database;
+    const bool loaded = antivirus::service::LoadServiceAntivirusDatabase(
+        database,
+        &loadResult);
+    const std::string sourceName = loaded ? antivirus::storage::ToString(loadResult.source) : "none";
+    const std::string lastUpdateStatus = loaded
+        ? "Startup load completed"
+        : (loadResult.message.empty() ? "Startup load failed" : loadResult.message);
+    UpdateLoadedDatabaseState(
+        database,
+        loaded,
+        sourceName,
+        lastUpdateStatus,
+        loadResult.skippedRecordCount,
+        "DEMO-HMAC-SHA256");
+    g_forceDatabaseUpdateRequested.store(!loaded || loadResult.source != antivirus::storage::AvDatabaseLoadSource::Main);
+    {
+        std::lock_guard<std::mutex> guard(g_avMaintenanceMutex);
+        g_pendingDatabaseRepairIds = loadResult.skippedRecordIds;
+    }
 
-    const antivirus::engine::AvDatabaseInfo info = g_avSignatureDatabase.GetInfo();
+    const antivirus::engine::AvDatabaseInfo info = database.GetInfo();
     const std::wstring releaseDate = ToWide(info.releaseDateUtc);
     DebugLogService(
-        L"Antivirus database loaded in memory: release=%ls, records=%llu",
+        L"Antivirus database loaded in memory: source=%S, release=%ls, records=%llu, skipped=%llu",
+        antivirus::storage::ToString(loadResult.source),
         releaseDate.c_str(),
-        static_cast<unsigned long long>(info.recordCount));
+        static_cast<unsigned long long>(info.recordCount),
+        static_cast<unsigned long long>(loadResult.skippedRecordCount));
 }
 
 // Clears in-memory antivirus signatures before the service process exits.
@@ -647,6 +852,489 @@ void ShutdownAntivirusEngineLayer()
     std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
     g_avSignatureDatabase.Clear();
     g_avDatabaseLoaded = false;
+    g_avDatabaseSourceName = "none";
+    g_avLastSuccessfulManifestVerificationUtc.clear();
+    g_avSkippedRecordCount = 0;
+    g_avVerifierName = "DEMO-HMAC-SHA256";
+    g_forceDatabaseUpdateRequested.store(false);
+    std::lock_guard<std::mutex> maintenanceGuard(g_avMaintenanceMutex);
+    g_pendingDatabaseRepairIds.clear();
+}
+
+// Executes a server update and swaps the in-memory database only after success/rollback load.
+void RunScheduledDatabaseUpdate(bool forceUpdate)
+{
+    UNREFERENCED_PARAMETER(forceUpdate);
+
+    const auto updaterContext = BuildDatabaseUpdaterContext();
+    if (!updaterContext.has_value())
+    {
+        return;
+    }
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        databaseSnapshot = antivirus::engine::AvSignatureDatabase();
+    }
+
+    antivirus::service::AvDatabaseUpdateResult updateResult;
+    antivirus::engine::AvSignatureDatabase updatedDatabase = databaseSnapshot;
+    const bool updated = antivirus::service::UpdateDatabaseFromServer(
+        *updaterContext,
+        forceUpdate,
+        updatedDatabase,
+        &updateResult);
+
+    if (updated || (updateResult.loadResult.loaded && updateResult.rolledBack))
+    {
+        UpdateLoadedDatabaseState(
+            updatedDatabase,
+            updateResult.loadResult.loaded,
+            updated ? (forceUpdate ? "forcedUpdate" : "updated") : antivirus::storage::ToString(updateResult.loadResult.source),
+            updateResult.message.empty() ? "Update finished" : updateResult.message,
+            updateResult.skippedRecordCount,
+            updated ? "SHA256withRSA" : g_avVerifierName);
+        std::lock_guard<std::mutex> maintenanceGuard(g_avMaintenanceMutex);
+        g_pendingDatabaseRepairIds.clear();
+    }
+    else if (!updateResult.message.empty())
+    {
+        std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+        g_avLastUpdateStatus = updateResult.message;
+    }
+
+    g_forceDatabaseUpdateRequested.store(false);
+}
+
+// Repairs skipped compact DB records through /api/binary/signatures/by-ids when the API session allows it.
+void RepairSkippedDatabaseRecords(const std::vector<std::array<uint8_t, 16>>& recordIds)
+{
+    if (recordIds.empty())
+    {
+        return;
+    }
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        return;
+    }
+
+    const auto updaterContext = BuildDatabaseUpdaterContext();
+    if (!updaterContext.has_value())
+    {
+        return;
+    }
+
+    antivirus::service::AvDatabaseUpdateResult updateResult;
+    antivirus::engine::AvSignatureDatabase repairedDatabase = databaseSnapshot;
+    const bool repaired = antivirus::service::RepairDamagedRecordsFromServer(
+        *updaterContext,
+        recordIds,
+        repairedDatabase,
+        &updateResult);
+    if (repaired || (updateResult.loadResult.loaded && updateResult.rolledBack))
+    {
+        UpdateLoadedDatabaseState(
+            repairedDatabase,
+            updateResult.loadResult.loaded,
+            repaired ? "updated" : antivirus::storage::ToString(updateResult.loadResult.source),
+            updateResult.message.empty() ? "Record repair finished" : updateResult.message,
+            updateResult.skippedRecordCount,
+            repaired ? "SHA256withRSA" : g_avVerifierName);
+    }
+}
+
+// Runs background database refresh and scheduled full-disk scans while the license allows AV work.
+void AntivirusWorkerLoop()
+{
+    auto nextDatabaseUpdateAt = std::chrono::system_clock::now() + kDatabaseUpdateInterval;
+    auto nextScheduledScanAt = std::chrono::system_clock::now() + kScheduledScanInterval;
+
+    while (!g_antivirusWorkerStopRequested.load())
+    {
+        const auto now = std::chrono::system_clock::now();
+        if (g_antivirusBackgroundTasksRunning)
+        {
+            if (g_forceDatabaseUpdateRequested.load() || now >= nextDatabaseUpdateAt)
+            {
+                RunScheduledDatabaseUpdate(g_forceDatabaseUpdateRequested.load());
+                nextDatabaseUpdateAt = std::chrono::system_clock::now() + kDatabaseUpdateInterval;
+            }
+
+            std::vector<std::array<uint8_t, 16>> repairIds;
+            {
+                std::lock_guard<std::mutex> guard(g_avMaintenanceMutex);
+                repairIds = g_pendingDatabaseRepairIds;
+                g_pendingDatabaseRepairIds.clear();
+            }
+            if (!repairIds.empty())
+            {
+                RepairSkippedDatabaseRecords(repairIds);
+            }
+
+            if (now >= nextScheduledScanAt)
+            {
+                bool schedulerEnabled = false;
+                {
+                    std::lock_guard<std::mutex> guard(g_schedulerMutex);
+                    schedulerEnabled = g_scheduledScanState.enabled && !g_scheduledScanState.running;
+                    if (schedulerEnabled)
+                    {
+                        g_scheduledScanState.running = true;
+                        g_scheduledScanState.lastStatus = "running";
+                    }
+                }
+
+                antivirus::engine::AvSignatureDatabase databaseSnapshot;
+                if (schedulerEnabled && SnapshotAntivirusDatabase(&databaseSnapshot))
+                {
+                    const antivirus::service::DirectoryScanResult scanResult =
+                        antivirus::service::ScanFixedDrives(databaseSnapshot);
+                    {
+                        std::lock_guard<std::mutex> guard(g_schedulerMutex);
+                        g_scheduledScanState.running = false;
+                        g_scheduledScanState.lastRunUtc = BuildCurrentUtcTimestamp();
+                        g_scheduledScanState.lastResult = scanResult;
+                        g_scheduledScanState.lastStatus =
+                            "finished: total=" + std::to_string(scanResult.totalScanned)
+                            + ", infected=" + std::to_string(scanResult.infectedCount)
+                            + ", errors=" + std::to_string(scanResult.errorCount);
+                    }
+                    DebugLogService(
+                        L"Scheduled fixed-drive scan finished: scanned=%llu infected=%llu errors=%llu",
+                        static_cast<unsigned long long>(scanResult.totalScanned),
+                        static_cast<unsigned long long>(scanResult.infectedCount),
+                        static_cast<unsigned long long>(scanResult.errorCount));
+                }
+                else if (schedulerEnabled)
+                {
+                    std::lock_guard<std::mutex> guard(g_schedulerMutex);
+                    g_scheduledScanState.running = false;
+                    g_scheduledScanState.lastRunUtc = BuildCurrentUtcTimestamp();
+                    g_scheduledScanState.lastStatus = "skipped: database is not loaded";
+                }
+
+                nextScheduledScanAt = std::chrono::system_clock::now() + kScheduledScanInterval;
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(kAntivirusWorkerPollIntervalMs));
+    }
+}
+
+// Starts the background antivirus worker.
+void StartAntivirusWorker()
+{
+    g_antivirusWorkerStopRequested.store(false);
+    if (!g_antivirusWorkerThread.joinable())
+    {
+        g_antivirusWorkerThread = std::thread(AntivirusWorkerLoop);
+    }
+}
+
+// Stops the background antivirus worker.
+void StopAntivirusWorker()
+{
+    g_antivirusWorkerStopRequested.store(true);
+    if (g_antivirusWorkerThread.joinable())
+    {
+        g_antivirusWorkerThread.join();
+    }
+}
+
+// Resolves initial monitored directories from env or a safe ProgramData fallback.
+std::vector<std::filesystem::path> ResolveConfiguredMonitoredDirectories()
+{
+    std::vector<std::filesystem::path> directories;
+    const std::string configured = ReadEnvironmentVariableUtf8(L"ANTIVIRUS_MONITOR_DIRS");
+    if (!configured.empty())
+    {
+        size_t begin = 0;
+        while (begin < configured.size())
+        {
+            size_t end = configured.find(';', begin);
+            if (end == std::string::npos)
+            {
+                end = configured.size();
+            }
+
+            const std::string part = configured.substr(begin, end - begin);
+            if (!part.empty())
+            {
+                directories.emplace_back(ToWide(part));
+            }
+
+            begin = end + 1;
+        }
+    }
+
+    if (directories.empty())
+    {
+        directories.push_back(antivirus::storage::ResolveDefaultDatabasePaths().mainDatabasePath.parent_path() / "Watch");
+    }
+
+    return directories;
+}
+
+void EnsureMonitoringStateInitialized()
+{
+    std::lock_guard<std::mutex> guard(g_monitoringMutex);
+    if (!g_monitoringState.directories.empty())
+    {
+        return;
+    }
+
+    g_monitoringState.directories = ResolveConfiguredMonitoredDirectories();
+    g_monitoringState.enabled = !g_monitoringState.directories.empty();
+    g_monitoringState.lastStatus = g_monitoringState.enabled
+        ? "configured"
+        : "disabled";
+}
+
+std::vector<std::filesystem::path> ResolveMonitoredDirectories()
+{
+    EnsureMonitoringStateInitialized();
+    std::lock_guard<std::mutex> guard(g_monitoringMutex);
+    return g_monitoringState.directories;
+}
+
+bool ShouldDebounceMonitoringPath(const std::filesystem::path& path)
+{
+    const std::wstring key = path.wstring();
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> guard(g_monitoringMutex);
+    const auto it = g_monitoringDebounceByPath.find(key);
+    if (it != g_monitoringDebounceByPath.end() && now - it->second < kMonitorDebounceInterval)
+    {
+        return true;
+    }
+
+    g_monitoringDebounceByPath[key] = now;
+    return false;
+}
+
+// Scans one changed file detected by the directory monitor.
+void ScanMonitoredFile(const std::filesystem::path& path)
+{
+    if (!g_antivirusBackgroundTasksRunning || ShouldDebounceMonitoringPath(path))
+    {
+        return;
+    }
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        return;
+    }
+
+    const antivirus::service::FileScanResult result = antivirus::service::ScanFilePath(path, databaseSnapshot);
+    {
+        std::lock_guard<std::mutex> guard(g_monitoringMutex);
+        g_monitoringState.lastEventUtc = BuildCurrentUtcTimestamp();
+        g_monitoringState.lastStatus = result.status == antivirus::service::FileScanStatus::Clean
+            ? "last event clean"
+            : result.message;
+    }
+    if (result.status != antivirus::service::FileScanStatus::Clean)
+    {
+        DebugLogService(
+            L"Directory monitor scan: path=%ls status=%d message=%S",
+            path.c_str(),
+            static_cast<int>(result.status),
+            result.message.c_str());
+    }
+}
+
+// Monitors one directory recursively and scans changed files without duplicating scanner logic.
+void DirectoryMonitorLoop(DirectoryMonitorState* monitor)
+{
+    if (monitor == nullptr)
+    {
+        return;
+    }
+
+    constexpr DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME
+        | FILE_NOTIFY_CHANGE_DIR_NAME
+        | FILE_NOTIFY_CHANGE_LAST_WRITE
+        | FILE_NOTIFY_CHANGE_CREATION;
+    std::array<uint8_t, 64 * 1024> buffer{};
+
+    monitor->handle = CreateFileW(
+        monitor->path.c_str(),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (monitor->handle == INVALID_HANDLE_VALUE)
+    {
+        DebugLogService(L"Directory monitor cannot open %ls", monitor->path.c_str());
+        return;
+    }
+
+    while (!monitor->stopRequested.load())
+    {
+        DWORD bytesReturned = 0;
+        if (!ReadDirectoryChangesW(
+                monitor->handle,
+                buffer.data(),
+                static_cast<DWORD>(buffer.size()),
+                TRUE,
+                filter,
+                &bytesReturned,
+                nullptr,
+                nullptr))
+        {
+            if (monitor->stopRequested.load())
+            {
+                break;
+            }
+
+            Sleep(kServiceStatusPollIntervalMs);
+            continue;
+        }
+
+        size_t offset = 0;
+        while (offset + sizeof(FILE_NOTIFY_INFORMATION) <= bytesReturned)
+        {
+            const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer.data() + offset);
+            const std::wstring fileName(info->FileName, info->FileNameLength / sizeof(WCHAR));
+            if (info->Action == FILE_ACTION_ADDED
+                || info->Action == FILE_ACTION_MODIFIED
+                || info->Action == FILE_ACTION_RENAMED_NEW_NAME)
+            {
+                ScanMonitoredFile(monitor->path / fileName);
+            }
+
+            if (info->NextEntryOffset == 0)
+            {
+                break;
+            }
+
+            offset += info->NextEntryOffset;
+        }
+    }
+
+    if (monitor->handle != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(monitor->handle);
+        monitor->handle = INVALID_HANDLE_VALUE;
+    }
+}
+
+// Starts recursive directory monitors for the configured paths.
+void StartDirectoryMonitors()
+{
+    const std::vector<std::filesystem::path> directories = ResolveMonitoredDirectories();
+    std::lock_guard<std::mutex> monitorGuard(g_directoryMonitorsMutex);
+    g_directoryMonitors.clear();
+    for (const std::filesystem::path& path : directories)
+    {
+        std::error_code error;
+        std::filesystem::create_directories(path, error);
+        if (error)
+        {
+            DebugLogService(L"Directory monitor cannot create %ls", path.c_str());
+            std::lock_guard<std::mutex> statusGuard(g_monitoringMutex);
+            g_monitoringState.lastStatus = "cannot create monitored directory";
+            continue;
+        }
+
+        auto monitor = std::make_unique<DirectoryMonitorState>();
+        monitor->path = path;
+        monitor->thread = std::thread(DirectoryMonitorLoop, monitor.get());
+        g_directoryMonitors.push_back(std::move(monitor));
+    }
+
+    std::lock_guard<std::mutex> statusGuard(g_monitoringMutex);
+    g_monitoringState.enabled = !g_directoryMonitors.empty();
+    g_monitoringState.lastStatus = g_directoryMonitors.empty()
+        ? "disabled"
+        : "watching " + std::to_string(g_directoryMonitors.size()) + " directorie(s)";
+}
+
+// Stops all recursive directory monitors.
+void StopDirectoryMonitors()
+{
+    std::lock_guard<std::mutex> monitorGuard(g_directoryMonitorsMutex);
+    for (const auto& monitor : g_directoryMonitors)
+    {
+        monitor->stopRequested.store(true);
+        if (monitor->handle != INVALID_HANDLE_VALUE)
+        {
+            CancelIoEx(monitor->handle, nullptr);
+        }
+    }
+
+    for (const auto& monitor : g_directoryMonitors)
+    {
+        if (monitor->thread.joinable())
+        {
+            monitor->thread.join();
+        }
+    }
+
+    g_directoryMonitors.clear();
+}
+
+bool AddMonitoredDirectoryPath(const std::filesystem::path& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    EnsureMonitoringStateInitialized();
+    {
+        std::lock_guard<std::mutex> guard(g_monitoringMutex);
+        const auto exists = std::find(
+            g_monitoringState.directories.begin(),
+            g_monitoringState.directories.end(),
+            path);
+        if (exists != g_monitoringState.directories.end())
+        {
+            g_monitoringState.enabled = true;
+            g_monitoringState.lastStatus = "directory already monitored";
+            return true;
+        }
+
+        g_monitoringState.directories.push_back(path);
+        g_monitoringState.enabled = true;
+        g_monitoringState.lastStatus = "directory added";
+    }
+
+    StopDirectoryMonitors();
+    StartDirectoryMonitors();
+    return true;
+}
+
+bool RemoveMonitoredDirectoryPath(const std::filesystem::path& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    EnsureMonitoringStateInitialized();
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> guard(g_monitoringMutex);
+        auto it = std::remove(
+            g_monitoringState.directories.begin(),
+            g_monitoringState.directories.end(),
+            path);
+        removed = it != g_monitoringState.directories.end();
+        g_monitoringState.directories.erase(it, g_monitoringState.directories.end());
+        g_monitoringState.enabled = !g_monitoringState.directories.empty();
+        g_monitoringState.lastStatus = removed ? "directory removed" : "directory not found";
+    }
+
+    StopDirectoryMonitors();
+    StartDirectoryMonitors();
+    return removed;
 }
 
 // Writes service protection diagnostics through the service logger.
@@ -1680,12 +2368,16 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
 
     ReportServiceStatus(SERVICE_RUNNING, NO_ERROR, 0);
     HardenRunningServiceObjects();
+    StartAntivirusWorker();
+    StartDirectoryMonitors();
     LaunchGuiInAllUserSessions();
     StartGuiSessionMonitor();
 
     RPC_STATUS waitStatus = RpcMgmtWaitServerListen();
     if (waitStatus != RPC_S_OK && waitStatus != RPC_S_NOT_LISTENING)
     {
+        StopDirectoryMonitors();
+        StopAntivirusWorker();
         StopGuiSessionMonitor();
         ShutdownWebApiLayer();
         ShutdownAntivirusEngineLayer();
@@ -1693,6 +2385,8 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
         return;
     }
 
+    StopDirectoryMonitors();
+    StopAntivirusWorker();
     StopGuiSessionMonitor();
     StopTrackedGuiProcesses();
     ShutdownWebApiLayer();
@@ -1858,7 +2552,32 @@ extern "C" RpcResultCode GetActiveLicenseInfo(
     const RpcResultCode licenseCode = EnsureValidLicenseForAntivirus();
     if (licenseCode == RPC_RESULT_OK)
     {
-        InitializeAntivirusEngineLayer();
+        bool needsInitialization = false;
+        {
+            std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+            needsInitialization = !g_avDatabaseLoaded;
+        }
+
+        if (needsInitialization)
+        {
+            InitializeAntivirusEngineLayer();
+        }
+
+        if (g_forceDatabaseUpdateRequested.load())
+        {
+            RunScheduledDatabaseUpdate(true);
+        }
+
+        std::vector<std::array<uint8_t, 16>> repairIds;
+        {
+            std::lock_guard<std::mutex> guard(g_avMaintenanceMutex);
+            repairIds = g_pendingDatabaseRepairIds;
+            g_pendingDatabaseRepairIds.clear();
+        }
+        if (!repairIds.empty())
+        {
+            RepairSkippedDatabaseRecords(repairIds);
+        }
     }
 
     FillRpcLicenseInfo(licenseInfo, licenseCode, LicenseCodeToText(licenseCode));
@@ -1942,6 +2661,23 @@ extern "C" RpcResultCode ActivateProduct(
     }
 
     const RpcResultCode licenseCode = EnsureValidLicenseForAntivirus();
+    if (licenseCode == RPC_RESULT_OK && g_forceDatabaseUpdateRequested.load())
+    {
+        RunScheduledDatabaseUpdate(true);
+    }
+    if (licenseCode == RPC_RESULT_OK)
+    {
+        std::vector<std::array<uint8_t, 16>> repairIds;
+        {
+            std::lock_guard<std::mutex> guard(g_avMaintenanceMutex);
+            repairIds = g_pendingDatabaseRepairIds;
+            g_pendingDatabaseRepairIds.clear();
+        }
+        if (!repairIds.empty())
+        {
+            RepairSkippedDatabaseRecords(repairIds);
+        }
+    }
     FillRpcLicenseInfo(licenseInfo, licenseCode, LicenseCodeToText(licenseCode));
     return licenseCode;
 }
@@ -1958,15 +2694,15 @@ extern "C" RpcResultCode ScanFile(
 
     *scanResult = RpcScanFileResult{};
 
-    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
-    if (!g_avDatabaseLoaded)
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
     {
         FillRpcScanErrorResult(path, "Antivirus database is not loaded", scanResult);
         return RPC_RESULT_OK;
     }
 
     const antivirus::service::FileScanResult result =
-        antivirus::service::ScanFilePath(std::filesystem::path(path), g_avSignatureDatabase);
+        antivirus::service::ScanFilePath(std::filesystem::path(path), databaseSnapshot);
     FillRpcScanFileResult(result, scanResult);
     return RPC_RESULT_OK;
 }
@@ -1983,9 +2719,9 @@ extern "C" RpcResultCode ScanDirectory(
 
     *scanResult = RpcScanDirectoryResult{};
 
-    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
     antivirus::service::DirectoryScanResult result;
-    if (!g_avDatabaseLoaded)
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
     {
         antivirus::service::FileScanResult fileResult;
         fileResult.status = antivirus::service::FileScanStatus::Error;
@@ -1998,7 +2734,7 @@ extern "C" RpcResultCode ScanDirectory(
     }
     else
     {
-        result = antivirus::service::ScanDirectoryPath(std::filesystem::path(path), g_avSignatureDatabase);
+        result = antivirus::service::ScanDirectoryPath(std::filesystem::path(path), databaseSnapshot);
     }
 
     return FillRpcScanDirectoryResult(result, scanResult)
@@ -2016,9 +2752,140 @@ extern "C" RpcResultCode GetAvDatabaseInfo(RpcAvDatabaseInfo* databaseInfo)
 
     *databaseInfo = RpcAvDatabaseInfo{};
     std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    bool schedulerEnabled = false;
+    std::string schedulerStatus;
+    {
+        std::lock_guard<std::mutex> schedulerGuard(g_schedulerMutex);
+        schedulerEnabled = g_scheduledScanState.enabled;
+        schedulerStatus = g_scheduledScanState.lastStatus;
+        if (g_scheduledScanState.running)
+        {
+            schedulerStatus = "running";
+        }
+    }
+
+    bool monitoringEnabled = false;
+    std::string monitoringStatus;
+    {
+        std::lock_guard<std::mutex> monitoringGuard(g_monitoringMutex);
+        monitoringEnabled = g_monitoringState.enabled;
+        monitoringStatus = g_monitoringState.lastStatus;
+    }
+
     const antivirus::service::AvDatabaseRuntimeInfo info =
-        antivirus::service::GetDatabaseRuntimeInfo(g_avSignatureDatabase, g_avDatabaseLoaded);
+        antivirus::service::GetDatabaseRuntimeInfo(
+            g_avSignatureDatabase,
+            g_avDatabaseLoaded,
+            g_avDatabaseSourceName,
+            g_avLastUpdateStatus,
+            g_avLastSuccessfulLoadUtc,
+            g_avLastSuccessfulManifestVerificationUtc,
+            g_avSkippedRecordCount,
+            g_avVerifierName,
+            schedulerEnabled,
+            monitoringEnabled,
+            schedulerStatus,
+            monitoringStatus);
     FillRpcAvDatabaseInfo(info, databaseInfo);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode ScanFixedDrives(RpcScanDirectoryResult* scanResult)
+{
+    if (scanResult == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    *scanResult = RpcScanDirectoryResult{};
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        antivirus::service::DirectoryScanResult result;
+        antivirus::service::FileScanResult fileResult;
+        fileResult.status = antivirus::service::FileScanStatus::Error;
+        fileResult.message = "Antivirus database is not loaded";
+        result.totalScanned = 1;
+        result.errorCount = 1;
+        result.results.push_back(std::move(fileResult));
+        return FillRpcScanDirectoryResult(result, scanResult)
+            ? RPC_RESULT_OK
+            : RPC_RESULT_INTERNAL_ERROR;
+    }
+
+    const antivirus::service::DirectoryScanResult result =
+        antivirus::service::ScanFixedDrives(databaseSnapshot);
+    return FillRpcScanDirectoryResult(result, scanResult)
+        ? RPC_RESULT_OK
+        : RPC_RESULT_INTERNAL_ERROR;
+}
+
+extern "C" RpcResultCode GetSchedulerStatus(RpcSchedulerStatus* schedulerStatus)
+{
+    if (schedulerStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    FillRpcSchedulerStatus(schedulerStatus);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode SetSchedulerEnabled(long enabled, RpcSchedulerStatus* schedulerStatus)
+{
+    if (schedulerStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(g_schedulerMutex);
+        g_scheduledScanState.enabled = enabled != 0;
+        g_scheduledScanState.lastStatus = g_scheduledScanState.enabled ? "enabled" : "disabled";
+    }
+    FillRpcSchedulerStatus(schedulerStatus);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode GetMonitoringStatus(RpcMonitoringStatus* monitoringStatus)
+{
+    if (monitoringStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    EnsureMonitoringStateInitialized();
+    FillRpcMonitoringStatus(monitoringStatus);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode GetMonitoredDirectories(RpcMonitoringStatus* monitoringStatus)
+{
+    return GetMonitoringStatus(monitoringStatus);
+}
+
+extern "C" RpcResultCode AddMonitoredDirectory(const wchar_t* path, RpcMonitoringStatus* monitoringStatus)
+{
+    if (path == nullptr || *path == L'\0' || monitoringStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    AddMonitoredDirectoryPath(std::filesystem::path(path));
+    FillRpcMonitoringStatus(monitoringStatus);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode RemoveMonitoredDirectory(const wchar_t* path, RpcMonitoringStatus* monitoringStatus)
+{
+    if (path == nullptr || *path == L'\0' || monitoringStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    RemoveMonitoredDirectoryPath(std::filesystem::path(path));
+    FillRpcMonitoringStatus(monitoringStatus);
     return RPC_RESULT_OK;
 }
 

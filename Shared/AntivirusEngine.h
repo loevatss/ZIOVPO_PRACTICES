@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -19,14 +20,26 @@ enum class AvObjectType
     ScriptText = 2,
 };
 
+enum class AvSignatureMatchMode
+{
+    LegacyFullFragmentHash = 1,
+    PrefixAndRemainderHash = 2,
+};
+
 struct AvSignatureRecord
 {
     uint64_t ObjectSignaturePrefix = 0;
     uint32_t ObjectSignatureLength = 0;
     std::vector<uint8_t> ObjectSignature;
+    std::vector<uint8_t> PrefixBytes;
+    uint64_t RemainderLength = 0;
     uint64_t OffsetBegin = 0;
     uint64_t OffsetEnd = 0;
     AvObjectType ObjectType = AvObjectType::Unknown;
+    AvSignatureMatchMode MatchMode = AvSignatureMatchMode::LegacyFullFragmentHash;
+    bool HasRecordId = false;
+    std::array<uint8_t, 16> RecordId{};
+    uint64_t UpdatedAtEpochMillis = 0;
     std::vector<uint8_t> AvRecordSignature;
 };
 
@@ -124,6 +137,8 @@ public:
         std::vector<uint8_t> avRecordSignature);
     // Returns records for a prefix using std::map logarithmic lookup.
     const std::vector<AvSignatureRecord>* FindRecords(uint64_t prefix) const;
+    // Returns a flat copy of all records for disk serialization.
+    std::vector<AvSignatureRecord> GetAllRecords() const;
     // Returns release date and record count for diagnostics.
     AvDatabaseInfo GetInfo() const;
 
@@ -143,15 +158,37 @@ public:
     AvScanResult Scan(IByteStream& stream, AvObjectType objectType) const;
 
 private:
+    struct AhoNode
+    {
+        std::map<uint8_t, size_t> next;
+        size_t failure = 0;
+        std::vector<const AvSignatureRecord*> outputs;
+    };
+
+    // Builds Aho-Corasick trie over stored prefix bytes.
+    void BuildAutomaton();
+    // Performs expensive remainder/hash verification for one trie hit.
+    bool VerifyMatch(
+        const std::vector<uint8_t>& objectBytes,
+        uint64_t position,
+        AvObjectType objectType,
+        const AvSignatureRecord& record) const;
+
     const AvSignatureDatabase& database_;
+    std::vector<AvSignatureRecord> records_;
+    std::vector<AhoNode> nodes_;
 };
 
 // Packs the first 8 signature bytes into a stable little-endian key.
 uint64_t PackSignaturePrefix(const uint8_t* bytes, size_t byteCount);
 // Calculates the demo hash stored in ObjectSignature fields.
 std::vector<uint8_t> HashSignatureFragment(const std::vector<uint8_t>& bytes);
+// Calculates a truncated SHA-256 used by imported backend remainder hashes.
+std::vector<uint8_t> HashSignatureRemainderSha256(const uint8_t* bytes, size_t byteCount, size_t hashLength);
 // Adds deterministic in-memory demo records used when the service starts.
 void LoadDefaultTestSignatures(AvSignatureDatabase& database);
 // Converts an object type to a compact diagnostic string.
 const char* ToString(AvObjectType objectType);
+// Converts a match mode to a compact diagnostic string.
+const char* ToString(AvSignatureMatchMode matchMode);
 } // namespace antivirus::engine

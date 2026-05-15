@@ -1,5 +1,11 @@
 #include "AntivirusScanService.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -122,20 +128,66 @@ FileScanResult MakeErrorResult(const std::filesystem::path& path, std::string me
 }
 } // namespace
 
-// Loads the default in-memory antivirus database for service runtime use.
+// Loads the antivirus database from service disk paths with fallback.
 bool LoadServiceAntivirusDatabase(engine::AvSignatureDatabase& database)
 {
-    database = engine::AvSignatureDatabase(engine::BuildCurrentUtcReleaseDate());
-    engine::LoadDefaultTestSignatures(database);
-    return database.GetInfo().recordCount > 0;
+    return LoadServiceAntivirusDatabase(database, nullptr);
+}
+
+// Loads the antivirus database and returns detailed fallback diagnostics.
+bool LoadServiceAntivirusDatabase(
+    engine::AvSignatureDatabase& database,
+    storage::AvDatabaseLoadResult* loadResult)
+{
+    const storage::AvDatabasePaths paths = storage::ResolveDefaultDatabasePaths();
+    return LoadServiceAntivirusDatabase(database, paths, loadResult);
+}
+
+// Loads the antivirus database from supplied paths for tests and service bootstrap.
+bool LoadServiceAntivirusDatabase(
+    engine::AvSignatureDatabase& database,
+    const storage::AvDatabasePaths& paths,
+    storage::AvDatabaseLoadResult* loadResult)
+{
+    const storage::DemoHmacSha256SignatureVerifier signatureVerifier;
+    storage::AvDatabaseLoadResult result =
+        storage::LoadDatabaseWithFallback(paths, signatureVerifier, database);
+    if (loadResult != nullptr)
+    {
+        *loadResult = result;
+    }
+
+    return result.loaded && result.databaseInfo.recordCount > 0;
 }
 
 // Returns database state in the format used by service RPC.
-AvDatabaseRuntimeInfo GetDatabaseRuntimeInfo(const engine::AvSignatureDatabase& database, bool loaded)
+AvDatabaseRuntimeInfo GetDatabaseRuntimeInfo(
+    const engine::AvSignatureDatabase& database,
+    bool loaded,
+    std::string sourceName,
+    std::string lastUpdateStatus,
+    std::string lastSuccessfulLoadUtc,
+    std::string lastSuccessfulManifestVerificationUtc,
+    size_t skippedRecordCount,
+    std::string verifierName,
+    bool schedulerEnabled,
+    bool monitoringEnabled,
+    std::string schedulerStatus,
+    std::string monitoringStatus)
 {
     AvDatabaseRuntimeInfo info;
     info.loaded = loaded;
     info.databaseInfo = database.GetInfo();
+    info.sourceName = std::move(sourceName);
+    info.lastUpdateStatus = std::move(lastUpdateStatus);
+    info.lastSuccessfulLoadUtc = std::move(lastSuccessfulLoadUtc);
+    info.lastSuccessfulManifestVerificationUtc = std::move(lastSuccessfulManifestVerificationUtc);
+    info.skippedRecordCount = skippedRecordCount;
+    info.verifierName = std::move(verifierName);
+    info.schedulerEnabled = schedulerEnabled;
+    info.monitoringEnabled = monitoringEnabled;
+    info.schedulerStatus = std::move(schedulerStatus);
+    info.monitoringStatus = std::move(monitoringStatus);
     return info;
 }
 
@@ -250,6 +302,44 @@ DirectoryScanResult ScanDirectoryPath(const std::filesystem::path& path, const e
     }
 
     return directoryResult;
+}
+
+// Scans all fixed drives through the existing directory scanner.
+DirectoryScanResult ScanFixedDrives(const engine::AvSignatureDatabase& database)
+{
+    DirectoryScanResult aggregate;
+    DWORD required = GetLogicalDriveStringsW(0, nullptr);
+    if (required == 0)
+    {
+        AppendResult(aggregate, MakeErrorResult({}, "Cannot enumerate logical drives"));
+        return aggregate;
+    }
+
+    std::vector<wchar_t> driveBuffer(required + 1, L'\0');
+    if (GetLogicalDriveStringsW(required, driveBuffer.data()) == 0)
+    {
+        AppendResult(aggregate, MakeErrorResult({}, "Cannot read logical drives"));
+        return aggregate;
+    }
+
+    for (const wchar_t* current = driveBuffer.data(); *current != L'\0'; current += std::wcslen(current) + 1)
+    {
+        if (GetDriveTypeW(current) != DRIVE_FIXED)
+        {
+            continue;
+        }
+
+        const DirectoryScanResult driveResult = ScanDirectoryPath(std::filesystem::path(current), database);
+        aggregate.totalScanned += driveResult.totalScanned;
+        aggregate.infectedCount += driveResult.infectedCount;
+        aggregate.errorCount += driveResult.errorCount;
+        aggregate.results.insert(
+            aggregate.results.end(),
+            driveResult.results.begin(),
+            driveResult.results.end());
+    }
+
+    return aggregate;
 }
 
 // Detects the scanner object type from file bytes and filename extension.

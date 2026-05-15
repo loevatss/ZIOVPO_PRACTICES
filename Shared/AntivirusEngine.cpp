@@ -1,13 +1,23 @@
 #include "AntivirusEngine.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <bcrypt.h>
+
 #include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <limits>
+#include <queue>
 #include <sstream>
 #include <system_error>
 #include <utility>
+
+#pragma comment(lib, "Bcrypt.lib")
 
 namespace antivirus::engine
 {
@@ -15,6 +25,11 @@ namespace
 {
 constexpr uint64_t kFnv1a64OffsetBasis = 14695981039346656037ull;
 constexpr uint64_t kFnv1a64Prime = 1099511628211ull;
+constexpr size_t kSha256Length = 32;
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
 
 // Converts a string literal into bytes for demo records.
 std::vector<uint8_t> BytesFromText(const char* text)
@@ -47,10 +62,89 @@ std::vector<uint8_t> UInt64ToLittleEndianBytes(uint64_t value)
 // Returns true when the signature record has internally consistent fields.
 bool IsValidRecord(const AvSignatureRecord& record)
 {
-    return record.ObjectSignatureLength >= kSignaturePrefixLength
-        && !record.ObjectSignature.empty()
-        && record.OffsetBegin <= record.OffsetEnd
-        && record.ObjectType != AvObjectType::Unknown;
+    const size_t prefixLength = record.PrefixBytes.empty()
+        ? kSignaturePrefixLength
+        : record.PrefixBytes.size();
+    if (prefixLength == 0
+        || record.OffsetBegin > record.OffsetEnd
+        || record.ObjectType == AvObjectType::Unknown)
+    {
+        return false;
+    }
+
+    if (record.MatchMode == AvSignatureMatchMode::LegacyFullFragmentHash)
+    {
+        return record.ObjectSignatureLength >= kSignaturePrefixLength
+            && !record.ObjectSignature.empty();
+    }
+
+    if (record.ObjectSignatureLength < prefixLength)
+    {
+        return false;
+    }
+
+    return record.RemainderLength == static_cast<uint64_t>(record.ObjectSignatureLength - prefixLength)
+        && (record.RemainderLength == 0 || !record.ObjectSignature.empty());
+}
+
+// Computes SHA-256 over the supplied bytes.
+std::vector<uint8_t> Sha256(const uint8_t* bytes, size_t byteCount)
+{
+    if (bytes == nullptr && byteCount != 0)
+    {
+        return {};
+    }
+
+    BCRYPT_ALG_HANDLE algorithmHandle = nullptr;
+    BCRYPT_HASH_HANDLE hashHandle = nullptr;
+    DWORD hashLength = 0;
+    DWORD bytesCopied = 0;
+    std::vector<uint8_t> hash;
+
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&algorithmHandle, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+    {
+        return {};
+    }
+
+    if (!NT_SUCCESS(BCryptGetProperty(
+            algorithmHandle,
+            BCRYPT_HASH_LENGTH,
+            reinterpret_cast<PUCHAR>(&hashLength),
+            sizeof(hashLength),
+            &bytesCopied,
+            0)))
+    {
+        BCryptCloseAlgorithmProvider(algorithmHandle, 0);
+        return {};
+    }
+
+    hash.resize(hashLength);
+    const bool success =
+        NT_SUCCESS(BCryptCreateHash(algorithmHandle, &hashHandle, nullptr, 0, nullptr, 0, 0))
+        && NT_SUCCESS(BCryptHashData(
+            hashHandle,
+            const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(bytes)),
+            static_cast<ULONG>(byteCount),
+            0))
+        && NT_SUCCESS(BCryptFinishHash(hashHandle, hash.data(), static_cast<ULONG>(hash.size()), 0));
+
+    if (hashHandle != nullptr)
+    {
+        BCryptDestroyHash(hashHandle);
+    }
+    BCryptCloseAlgorithmProvider(algorithmHandle, 0);
+    return success ? hash : std::vector<uint8_t>{};
+}
+
+// Extracts the first bytes from a legacy 64-bit prefix key.
+std::vector<uint8_t> PrefixBytesFromKey(uint64_t prefixKey)
+{
+    std::vector<uint8_t> bytes(kSignaturePrefixLength);
+    for (size_t i = 0; i < bytes.size(); ++i)
+    {
+        bytes[i] = static_cast<uint8_t>((prefixKey >> (i * 8)) & 0xFFu);
+    }
+    return bytes;
 }
 } // namespace
 
@@ -180,6 +274,11 @@ void AvSignatureDatabase::Clear()
 // Adds a prepared signature record under its 8-byte prefix key.
 bool AvSignatureDatabase::AddRecord(AvSignatureRecord record)
 {
+    if (record.PrefixBytes.empty())
+    {
+        record.PrefixBytes = PrefixBytesFromKey(record.ObjectSignaturePrefix);
+    }
+
     if (!IsValidRecord(record))
     {
         return false;
@@ -207,12 +306,21 @@ bool AvSignatureDatabase::AddSignature(
     }
 
     AvSignatureRecord record;
-    record.ObjectSignaturePrefix = PackSignaturePrefix(signatureBytes.data(), signatureBytes.size());
+    record.ObjectSignaturePrefix = PackSignaturePrefix(signatureBytes.data(), kSignaturePrefixLength);
     record.ObjectSignatureLength = static_cast<uint32_t>(signatureBytes.size());
-    record.ObjectSignature = HashSignatureFragment(signatureBytes);
+    record.PrefixBytes.assign(signatureBytes.begin(), signatureBytes.begin() + static_cast<std::ptrdiff_t>(kSignaturePrefixLength));
+    record.RemainderLength = static_cast<uint64_t>(signatureBytes.size() - kSignaturePrefixLength);
+    if (record.RemainderLength != 0)
+    {
+        record.ObjectSignature = HashSignatureRemainderSha256(
+            signatureBytes.data() + kSignaturePrefixLength,
+            signatureBytes.size() - kSignaturePrefixLength,
+            kSha256Length);
+    }
     record.OffsetBegin = offsetBegin;
     record.OffsetEnd = offsetEnd;
     record.ObjectType = objectType;
+    record.MatchMode = AvSignatureMatchMode::PrefixAndRemainderHash;
     record.AvRecordSignature = std::move(avRecordSignature);
     return AddRecord(std::move(record));
 }
@@ -229,6 +337,19 @@ const std::vector<AvSignatureRecord>* AvSignatureDatabase::FindRecords(uint64_t 
     return &it->second;
 }
 
+// Returns a flat copy of all records for disk serialization.
+std::vector<AvSignatureRecord> AvSignatureDatabase::GetAllRecords() const
+{
+    std::vector<AvSignatureRecord> records;
+    records.reserve(recordCount_);
+    for (const auto& [prefix, bucket] : recordsByPrefix_)
+    {
+        (void)prefix;
+        records.insert(records.end(), bucket.begin(), bucket.end());
+    }
+    return records;
+}
+
 // Returns release date and record count for diagnostics.
 AvDatabaseInfo AvSignatureDatabase::GetInfo() const
 {
@@ -241,6 +362,130 @@ AvDatabaseInfo AvSignatureDatabase::GetInfo() const
 // Creates a scanner over an immutable in-memory signature database.
 AvScanner::AvScanner(const AvSignatureDatabase& database) : database_(database)
 {
+    BuildAutomaton();
+}
+
+void AvScanner::BuildAutomaton()
+{
+    nodes_.clear();
+    nodes_.push_back(AhoNode{});
+    records_ = database_.GetAllRecords();
+
+    for (AvSignatureRecord& record : records_)
+    {
+        if (record.PrefixBytes.empty())
+        {
+            continue;
+        }
+
+        size_t state = 0;
+        for (const uint8_t byte : record.PrefixBytes)
+        {
+            const auto [it, inserted] = nodes_[state].next.emplace(byte, nodes_.size());
+            if (inserted)
+            {
+                nodes_.push_back(AhoNode{});
+            }
+            state = it->second;
+        }
+
+        nodes_[state].outputs.push_back(&record);
+    }
+
+    std::queue<size_t> pending;
+    for (const auto& [byte, nextState] : nodes_[0].next)
+    {
+        (void)byte;
+        nodes_[nextState].failure = 0;
+        pending.push(nextState);
+    }
+
+    while (!pending.empty())
+    {
+        const size_t state = pending.front();
+        pending.pop();
+
+        for (const auto& [byte, nextState] : nodes_[state].next)
+        {
+            size_t failure = nodes_[state].failure;
+            while (failure != 0 && !nodes_[failure].next.contains(byte))
+            {
+                failure = nodes_[failure].failure;
+            }
+
+            const auto failureTransition = nodes_[failure].next.find(byte);
+            if (failureTransition != nodes_[failure].next.end() && failureTransition->second != nextState)
+            {
+                nodes_[nextState].failure = failureTransition->second;
+            }
+            else
+            {
+                nodes_[nextState].failure = 0;
+            }
+
+            const std::vector<const AvSignatureRecord*>& inheritedOutputs =
+                nodes_[nodes_[nextState].failure].outputs;
+            nodes_[nextState].outputs.insert(
+                nodes_[nextState].outputs.end(),
+                inheritedOutputs.begin(),
+                inheritedOutputs.end());
+
+            pending.push(nextState);
+        }
+    }
+}
+
+bool AvScanner::VerifyMatch(
+    const std::vector<uint8_t>& objectBytes,
+    uint64_t position,
+    AvObjectType objectType,
+    const AvSignatureRecord& record) const
+{
+    if (record.ObjectType != objectType)
+    {
+        return false;
+    }
+
+    if (position < record.OffsetBegin || position > record.OffsetEnd)
+    {
+        return false;
+    }
+
+    if (record.ObjectSignatureLength < record.PrefixBytes.size()
+        || record.ObjectSignatureLength > objectBytes.size() - position)
+    {
+        return false;
+    }
+
+    if (!std::equal(
+            record.PrefixBytes.begin(),
+            record.PrefixBytes.end(),
+            objectBytes.begin() + static_cast<std::ptrdiff_t>(position)))
+    {
+        return false;
+    }
+
+    if (record.MatchMode == AvSignatureMatchMode::LegacyFullFragmentHash)
+    {
+        std::vector<uint8_t> fragment(record.ObjectSignatureLength);
+        std::copy_n(
+            objectBytes.data() + position,
+            static_cast<size_t>(record.ObjectSignatureLength),
+            fragment.begin());
+        return HashSignatureFragment(fragment) == record.ObjectSignature;
+    }
+
+    if (record.RemainderLength == 0)
+    {
+        return true;
+    }
+
+    const uint8_t* remainderBytes = objectBytes.data() + position + record.PrefixBytes.size();
+    const std::vector<uint8_t> remainderHash = HashSignatureRemainderSha256(
+        remainderBytes,
+        static_cast<size_t>(record.RemainderLength),
+        record.ObjectSignature.size());
+    return !remainderHash.empty() && remainderHash == record.ObjectSignature;
 }
 
 // Scans a byte stream for signatures of the supplied object type.
@@ -283,56 +528,34 @@ AvScanResult AvScanner::Scan(IByteStream& stream, AvObjectType objectType) const
         return result;
     }
 
-    for (uint64_t position = 0; position + kSignaturePrefixLength <= streamSize; ++position)
+    size_t state = 0;
+    for (uint64_t index = 0; index < streamSize; ++index)
     {
-        const uint8_t* prefixBytes = objectBytes.data() + position;
-        const uint64_t prefix = PackSignaturePrefix(prefixBytes, kSignaturePrefixLength);
-        const std::vector<AvSignatureRecord>* records = database_.FindRecords(prefix);
-        if (records == nullptr)
+        const uint8_t byte = objectBytes[static_cast<size_t>(index)];
+        while (state != 0 && !nodes_[state].next.contains(byte))
         {
-            continue;
+            state = nodes_[state].failure;
         }
 
-        bool hasCandidateAfterCheapChecks = false;
-        for (const AvSignatureRecord& record : *records)
+        const auto transition = nodes_[state].next.find(byte);
+        state = transition != nodes_[state].next.end() ? transition->second : 0;
+
+        for (const AvSignatureRecord* record : nodes_[state].outputs)
         {
-            if (record.ObjectType != objectType)
+            if (record == nullptr || static_cast<uint64_t>(record->PrefixBytes.size()) > index + 1)
             {
                 continue;
             }
 
-            if (position < record.OffsetBegin || position > record.OffsetEnd)
-            {
-                continue;
-            }
-
-            if (record.ObjectSignatureLength < kSignaturePrefixLength
-                || record.ObjectSignatureLength > streamSize - position)
-            {
-                continue;
-            }
-
-            hasCandidateAfterCheapChecks = true;
-            std::vector<uint8_t> fragment(record.ObjectSignatureLength);
-            std::copy_n(
-                objectBytes.data() + position,
-                static_cast<size_t>(record.ObjectSignatureLength),
-                fragment.begin());
-
-            const std::vector<uint8_t> fragmentHash = HashSignatureFragment(fragment);
-            if (fragmentHash == record.ObjectSignature)
+            const uint64_t position = index + 1 - static_cast<uint64_t>(record->PrefixBytes.size());
+            if (VerifyMatch(objectBytes, position, objectType, *record))
             {
                 result.scanCompleted = true;
                 result.malicious = true;
                 result.detectionOffset = position;
-                result.matchedRecord = record;
+                result.matchedRecord = *record;
                 return result;
             }
-        }
-
-        if (!hasCandidateAfterCheapChecks)
-        {
-            continue;
         }
     }
 
@@ -343,13 +566,14 @@ AvScanResult AvScanner::Scan(IByteStream& stream, AvObjectType objectType) const
 // Packs the first 8 signature bytes into a stable little-endian key.
 uint64_t PackSignaturePrefix(const uint8_t* bytes, size_t byteCount)
 {
-    if (bytes == nullptr || byteCount < kSignaturePrefixLength)
+    if (bytes == nullptr || byteCount == 0)
     {
         return 0;
     }
 
     uint64_t value = 0;
-    for (size_t i = 0; i < kSignaturePrefixLength; ++i)
+    const size_t prefixLength = std::min(kSignaturePrefixLength, byteCount);
+    for (size_t i = 0; i < prefixLength; ++i)
     {
         value |= static_cast<uint64_t>(bytes[i]) << (i * 8);
     }
@@ -367,6 +591,23 @@ std::vector<uint8_t> HashSignatureFragment(const std::vector<uint8_t>& bytes)
     }
 
     return UInt64ToLittleEndianBytes(hash);
+}
+
+// Calculates a truncated SHA-256 used by imported backend remainder hashes.
+std::vector<uint8_t> HashSignatureRemainderSha256(const uint8_t* bytes, size_t byteCount, size_t hashLength)
+{
+    if (hashLength == 0)
+    {
+        return {};
+    }
+
+    const std::vector<uint8_t> fullHash = Sha256(bytes, byteCount);
+    if (fullHash.size() != kSha256Length || hashLength > fullHash.size())
+    {
+        return {};
+    }
+
+    return std::vector<uint8_t>(fullHash.begin(), fullHash.begin() + static_cast<std::ptrdiff_t>(hashLength));
 }
 
 // Returns current UTC time as an ISO-8601 database release date.
@@ -424,6 +665,20 @@ const char* ToString(AvObjectType objectType)
         return "PE";
     case AvObjectType::ScriptText:
         return "ScriptText";
+    default:
+        return "Unknown";
+    }
+}
+
+// Converts a match mode to a compact diagnostic string.
+const char* ToString(AvSignatureMatchMode matchMode)
+{
+    switch (matchMode)
+    {
+    case AvSignatureMatchMode::LegacyFullFragmentHash:
+        return "LegacyFullHash";
+    case AvSignatureMatchMode::PrefixAndRemainderHash:
+        return "PrefixRemainderHash";
     default:
         return "Unknown";
     }

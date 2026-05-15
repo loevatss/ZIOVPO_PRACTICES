@@ -178,11 +178,15 @@ target_link_libraries(Antivirus PRIVATE Advapi32 Rpcrt4 Shell32)
 
 generate_rpc_sources(AntivirusService SERVICE_RPC_HEADER SERVICE_RPC_CLIENT_STUB SERVICE_RPC_SERVER_STUB)
 add_executable(AntivirusService
+    AntivirusService/AntivirusDatabaseUpdater.cpp
+    AntivirusService/AntivirusDatabaseUpdater.h
     AntivirusService/service.cpp
     AntivirusService/AntivirusEngineSelfTest.cpp
     AntivirusService/AntivirusEngineSelfTest.h
     AntivirusService/AntivirusScanService.cpp
     AntivirusService/AntivirusScanService.h
+    Shared/AntivirusDatabaseStorage.cpp
+    Shared/AntivirusDatabaseStorage.h
     Shared/AntivirusEngine.cpp
     Shared/AntivirusEngine.h
     Shared/ProcessProtection.cpp
@@ -199,7 +203,7 @@ target_include_directories(AntivirusService PRIVATE
 
 target_compile_definitions(AntivirusService PRIVATE UNICODE _UNICODE)
 target_compile_options(AntivirusService PRIVATE /utf-8)
-target_link_libraries(AntivirusService PRIVATE Advapi32 Rpcrt4 Wtsapi32 Userenv)
+target_link_libraries(AntivirusService PRIVATE Advapi32 Rpcrt4 Wtsapi32 Userenv Bcrypt)
 
 foreach(runtime_target IN ITEMS Antivirus AntivirusService)
     set_target_properties(${runtime_target} PROPERTIES

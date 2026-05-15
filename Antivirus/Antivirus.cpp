@@ -34,6 +34,7 @@
 constexpr UINT WMAPP_TRAYICON = WM_APP + 1;
 constexpr UINT WMAPP_SCAN_FILE_DONE = WM_APP + 2;
 constexpr UINT WMAPP_SCAN_DIRECTORY_DONE = WM_APP + 3;
+constexpr UINT WMAPP_SCAN_FIXED_DONE = WM_APP + 4;
 constexpr UINT TRAY_ICON_UID = 1;
 constexpr DWORD SERVICE_START_TIMEOUT_MS = 30000;
 constexpr DWORD SERVICE_STATUS_POLL_INTERVAL_MS = 250;
@@ -58,6 +59,8 @@ constexpr int IDC_BUTTON_REFRESH_DATABASE = 2016;
 constexpr int IDC_LABEL_DATABASE_INFO = 2017;
 constexpr int IDC_LABEL_SCAN_SUMMARY = 2018;
 constexpr int IDC_LIST_SCAN_RESULTS = 2019;
+constexpr int IDC_BUTTON_SCAN_FIXED = 2020;
+constexpr int IDC_BUTTON_TOGGLE_SCHEDULER = 2021;
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -86,7 +89,9 @@ HWND g_hButtonLogout = nullptr;
 HWND g_hButtonAvAction = nullptr;
 HWND g_hLabelAvStatus = nullptr;
 HWND g_hButtonScanDirectory = nullptr;
+HWND g_hButtonScanFixed = nullptr;
 HWND g_hButtonRefreshDatabase = nullptr;
+HWND g_hButtonToggleScheduler = nullptr;
 HWND g_hLabelDatabaseInfo = nullptr;
 HWND g_hLabelScanSummary = nullptr;
 HWND g_hListScanResults = nullptr;
@@ -167,8 +172,12 @@ bool ActivateProductViaRpc(
 bool QueryAvDatabaseInfoViaRpc(RpcAvDatabaseInfo& databaseInfo);
 bool ScanFileViaRpc(const std::wstring& path, RpcScanFileResult& scanResult);
 bool ScanDirectoryViaRpc(const std::wstring& path, RpcScanDirectoryResult& scanResult);
+bool ScanFixedDrivesViaRpc(RpcScanDirectoryResult& scanResult);
+bool GetSchedulerStatusViaRpc(RpcSchedulerStatus& schedulerStatus);
+bool SetSchedulerEnabledViaRpc(bool enabled, RpcSchedulerStatus& schedulerStatus);
 void StartFileScanWorker(HWND hWnd, std::wstring path);
 void StartDirectoryScanWorker(HWND hWnd, std::wstring path);
+void StartFixedDrivesScanWorker(HWND hWnd);
 void FinishFileScan(HWND hWnd, GuiFileScanCompletion* completion);
 void FinishDirectoryScan(HWND hWnd, GuiDirectoryScanCompletion* completion);
 void CreateSecurityControls(HWND hWnd);
@@ -181,7 +190,9 @@ void HandleActivationAction(HWND hWnd);
 void HandleLogoutAction(HWND hWnd);
 void HandleAntivirusAction(HWND hWnd);
 void HandleScanDirectoryAction(HWND hWnd);
+void HandleScanFixedDrivesAction(HWND hWnd);
 void HandleRefreshDatabaseAction(HWND hWnd);
+void HandleToggleSchedulerAction(HWND hWnd);
 std::wstring GetControlText(HWND hWnd);
 std::wstring TrimCopy(const std::wstring& text);
 bool TrySelectFile(HWND owner, std::wstring& path);
@@ -901,6 +912,87 @@ bool ScanDirectoryViaRpc(const std::wstring& path, RpcScanDirectoryResult& scanR
     return rpcCallSucceeded;
 }
 
+bool ScanFixedDrivesViaRpc(RpcScanDirectoryResult& scanResult)
+{
+    std::memset(&scanResult, 0, sizeof(scanResult));
+    g_rpcCallMutex.lock();
+    if (!EnsureRpcBinding())
+    {
+        g_rpcCallMutex.unlock();
+        return false;
+    }
+
+    bool rpcCallSucceeded = true;
+    RpcTryExcept
+    {
+        const RpcResultCode result = ScanFixedDrives(&scanResult);
+        rpcCallSucceeded = (result == RPC_RESULT_OK);
+    }
+    RpcExcept(EXCEPTION_EXECUTE_HANDLER)
+    {
+        rpcCallSucceeded = false;
+    }
+    RpcEndExcept;
+
+    ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
+    return rpcCallSucceeded;
+}
+
+bool GetSchedulerStatusViaRpc(RpcSchedulerStatus& schedulerStatus)
+{
+    std::memset(&schedulerStatus, 0, sizeof(schedulerStatus));
+    g_rpcCallMutex.lock();
+    if (!EnsureRpcBinding())
+    {
+        g_rpcCallMutex.unlock();
+        return false;
+    }
+
+    bool rpcCallSucceeded = true;
+    RpcTryExcept
+    {
+        const RpcResultCode result = GetSchedulerStatus(&schedulerStatus);
+        rpcCallSucceeded = (result == RPC_RESULT_OK);
+    }
+    RpcExcept(EXCEPTION_EXECUTE_HANDLER)
+    {
+        rpcCallSucceeded = false;
+    }
+    RpcEndExcept;
+
+    ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
+    return rpcCallSucceeded;
+}
+
+bool SetSchedulerEnabledViaRpc(bool enabled, RpcSchedulerStatus& schedulerStatus)
+{
+    std::memset(&schedulerStatus, 0, sizeof(schedulerStatus));
+    g_rpcCallMutex.lock();
+    if (!EnsureRpcBinding())
+    {
+        g_rpcCallMutex.unlock();
+        return false;
+    }
+
+    bool rpcCallSucceeded = true;
+    RpcTryExcept
+    {
+        const RpcResultCode result = SetSchedulerEnabled(enabled ? 1 : 0, &schedulerStatus);
+        rpcCallSucceeded = (result == RPC_RESULT_OK);
+    }
+    RpcExcept(EXCEPTION_EXECUTE_HANDLER)
+    {
+        rpcCallSucceeded = false;
+    }
+    RpcEndExcept;
+
+    ReleaseRpcBinding();
+    g_rpcCallMutex.unlock();
+    return rpcCallSucceeded;
+}
+
 // Starts a background RPC file scan so the GUI thread stays responsive.
 void StartFileScanWorker(HWND hWnd, std::wstring path)
 {
@@ -932,6 +1024,26 @@ void StartDirectoryScanWorker(HWND hWnd, std::wstring path)
             {
                 MIDL_user_free(completion->result.results);
                 completion->result.results = nullptr;
+            }
+            return;
+        }
+
+        completion.release();
+    }).detach();
+}
+
+void StartFixedDrivesScanWorker(HWND hWnd)
+{
+    std::thread([hWnd]() {
+        auto completion = std::make_unique<GuiDirectoryScanCompletion>();
+        completion->path = L"Fixed drives";
+        completion->rpcSucceeded = ScanFixedDrivesViaRpc(completion->result);
+
+        if (!PostMessageW(hWnd, WMAPP_SCAN_FIXED_DONE, 0, reinterpret_cast<LPARAM>(completion.get())))
+        {
+            if (completion->result.results != nullptr)
+            {
+                MIDL_user_free(completion->result.results);
             }
             return;
         }
@@ -1512,6 +1624,12 @@ void CreateSecurityControls(HWND hWnd)
     g_hButtonScanDirectory = CreateWindowExW(0, L"BUTTON", L"Scan folder",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 186, 430, 140, 32, hWnd,
         MenuIdFromInt(IDC_BUTTON_SCAN_DIRECTORY), hInst, nullptr);
+    g_hButtonScanFixed = CreateWindowExW(0, L"BUTTON", L"Scan fixed drives",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 336, 430, 160, 32, hWnd,
+        MenuIdFromInt(IDC_BUTTON_SCAN_FIXED), hInst, nullptr);
+    g_hButtonToggleScheduler = CreateWindowExW(0, L"BUTTON", L"Toggle scheduler",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 506, 430, 160, 32, hWnd,
+        MenuIdFromInt(IDC_BUTTON_TOGGLE_SCHEDULER), hInst, nullptr);
     g_hLabelScanSummary = CreateWindowExW(0, L"STATIC", L"Scan results: no scan yet",
         WS_CHILD | WS_VISIBLE, 36, 470, 820, 24, hWnd,
         MenuIdFromInt(IDC_LABEL_SCAN_SUMMARY), hInst, nullptr);
@@ -1540,6 +1658,8 @@ void CreateSecurityControls(HWND hWnd)
     ApplyControlFont(g_hButtonLogout, g_hFontButton);
     ApplyControlFont(g_hButtonAvAction, g_hFontButton);
     ApplyControlFont(g_hButtonScanDirectory, g_hFontButton);
+    ApplyControlFont(g_hButtonScanFixed, g_hFontButton);
+    ApplyControlFont(g_hButtonToggleScheduler, g_hFontButton);
     ApplyControlFont(g_hLabelScanSummary, g_hFontText);
     ApplyControlFont(g_hListScanResults, g_hFontText);
 }
@@ -1594,6 +1714,8 @@ void UpdateSecurityUi(HWND hWnd)
     const BOOL enableScanButtons = (g_antivirusUnlocked && !g_scanInProgress) ? TRUE : FALSE;
     EnableWindow(g_hButtonAvAction, enableScanButtons);
     EnableWindow(g_hButtonScanDirectory, enableScanButtons);
+    EnableWindow(g_hButtonScanFixed, enableScanButtons);
+    EnableWindow(g_hButtonToggleScheduler, g_isAuthenticated ? TRUE : FALSE);
     EnableWindow(g_hButtonRefreshDatabase, TRUE);
     RedrawWindow(g_hButtonAvAction, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
 }
@@ -1692,8 +1814,32 @@ void RefreshAvDatabaseInfo(HWND hWnd)
         << L", release="
         << (databaseInfo.releaseDate[0] != L'\0' ? databaseInfo.releaseDate : L"-")
         << L", records="
-        << static_cast<long long>(databaseInfo.recordCount);
+        << static_cast<long long>(databaseInfo.recordCount)
+        << L", source="
+        << (databaseInfo.source[0] != L'\0' ? databaseInfo.source : L"-")
+        << L", last update="
+        << (databaseInfo.lastUpdateStatus[0] != L'\0' ? databaseInfo.lastUpdateStatus : L"-")
+        << L", last load="
+        << (databaseInfo.lastSuccessfulLoadUtc[0] != L'\0' ? databaseInfo.lastSuccessfulLoadUtc : L"-")
+        << L", manifest verified="
+        << (databaseInfo.lastManifestVerificationUtc[0] != L'\0' ? databaseInfo.lastManifestVerificationUtc : L"-")
+        << L", skipped="
+        << static_cast<long long>(databaseInfo.skippedRecordCount)
+        << L", verifier="
+        << (databaseInfo.verifier[0] != L'\0' ? databaseInfo.verifier : L"-")
+        << L", scheduler="
+        << (databaseInfo.schedulerEnabled != 0 ? L"enabled" : L"disabled")
+        << L" (" << (databaseInfo.schedulerStatus[0] != L'\0' ? databaseInfo.schedulerStatus : L"-") << L")"
+        << L", monitoring="
+        << (databaseInfo.monitoringEnabled != 0 ? L"enabled" : L"disabled")
+        << L" (" << (databaseInfo.monitoringStatus[0] != L'\0' ? databaseInfo.monitoringStatus : L"-") << L")";
     SetDatabaseInfoText(text.str());
+    if (g_hButtonToggleScheduler != nullptr)
+    {
+        SetWindowTextW(
+            g_hButtonToggleScheduler,
+            databaseInfo.schedulerEnabled != 0 ? L"Disable scheduler" : L"Enable scheduler");
+    }
 }
 
 // Handles login action in UI.
@@ -1828,9 +1974,51 @@ void HandleScanDirectoryAction(HWND hWnd)
     StartDirectoryScanWorker(hWnd, std::move(path));
 }
 
+void HandleScanFixedDrivesAction(HWND hWnd)
+{
+    if (!g_antivirusUnlocked || g_scanInProgress)
+    {
+        SetScanSummaryText(L"Fixed drive scan: authentication and active license are required");
+        return;
+    }
+
+    SetScanSummaryText(L"Fixed drive scan: running...");
+    ClearScanResults();
+    g_scanInProgress = true;
+    UpdateSecurityUi(hWnd);
+    StartFixedDrivesScanWorker(hWnd);
+}
+
 // Handles manual antivirus database metadata refresh.
 void HandleRefreshDatabaseAction(HWND hWnd)
 {
+    RefreshAvDatabaseInfo(hWnd);
+}
+
+void HandleToggleSchedulerAction(HWND hWnd)
+{
+    RpcSchedulerStatus schedulerStatus{};
+    if (!GetSchedulerStatusViaRpc(schedulerStatus))
+    {
+        SetScanSummaryText(L"Scheduler: RPC error while reading current state");
+        return;
+    }
+
+    if (!SetSchedulerEnabledViaRpc(schedulerStatus.enabled == 0, schedulerStatus))
+    {
+        SetScanSummaryText(L"Scheduler: RPC error while toggling state");
+        return;
+    }
+
+    SetScanSummaryText(schedulerStatus.enabled != 0
+        ? L"Scheduler: enabled"
+        : L"Scheduler: disabled");
+    if (g_hButtonToggleScheduler != nullptr)
+    {
+        SetWindowTextW(
+            g_hButtonToggleScheduler,
+            schedulerStatus.enabled != 0 ? L"Disable scheduler" : L"Enable scheduler");
+    }
     RefreshAvDatabaseInfo(hWnd);
 }
 
@@ -2005,6 +2193,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
+    if (message == WMAPP_SCAN_FIXED_DONE)
+    {
+        FinishDirectoryScan(hWnd, reinterpret_cast<GuiDirectoryScanCompletion*>(lParam));
+        return 0;
+    }
+
     switch (message)
     {
     case WM_COMMAND:
@@ -2030,8 +2224,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         case IDC_BUTTON_SCAN_DIRECTORY:
             HandleScanDirectoryAction(hWnd);
             return 0;
+        case IDC_BUTTON_SCAN_FIXED:
+            HandleScanFixedDrivesAction(hWnd);
+            return 0;
         case IDC_BUTTON_REFRESH_DATABASE:
             HandleRefreshDatabaseAction(hWnd);
+            return 0;
+        case IDC_BUTTON_TOGGLE_SCHEDULER:
+            HandleToggleSchedulerAction(hWnd);
             return 0;
         case IDM_TRAY_OPEN:
             ShowMainWindow(hWnd);

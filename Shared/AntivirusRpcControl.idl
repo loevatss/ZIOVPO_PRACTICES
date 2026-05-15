@@ -51,7 +51,37 @@ interface AntivirusRpcControl
         long loaded;
         hyper recordCount;
         wchar_t releaseDate[64];
+        wchar_t source[32];
+        wchar_t lastUpdateStatus[256];
+        wchar_t lastSuccessfulLoadUtc[64];
+        wchar_t lastManifestVerificationUtc[64];
+        hyper skippedRecordCount;
+        wchar_t verifier[64];
+        long schedulerEnabled;
+        long monitoringEnabled;
+        wchar_t schedulerStatus[256];
+        wchar_t monitoringStatus[256];
     } RpcAvDatabaseInfo;
+
+    typedef struct RpcSchedulerStatus
+    {
+        long enabled;
+        long running;
+        wchar_t lastRunUtc[64];
+        hyper totalScanned;
+        hyper infectedCount;
+        hyper errorCount;
+        wchar_t lastStatus[256];
+    } RpcSchedulerStatus;
+
+    typedef struct RpcMonitoringStatus
+    {
+        long enabled;
+        hyper directoryCount;
+        wchar_t directories[4096];
+        wchar_t lastEventUtc[64];
+        wchar_t lastStatus[256];
+    } RpcMonitoringStatus;
 
     typedef struct RpcScanFileResult
     {
@@ -114,6 +144,33 @@ interface AntivirusRpcControl
         [in, string] const wchar_t* path,
         [out] RpcScanDirectoryResult* scanResult);
 
+    // Scans all local fixed drives recursively.
+    RpcResultCode ScanFixedDrives([out] RpcScanDirectoryResult* scanResult);
+
     // Returns current in-memory antivirus database metadata.
     RpcResultCode GetAvDatabaseInfo([out] RpcAvDatabaseInfo* databaseInfo);
+
+    // Returns current scheduler state and last scheduled result.
+    RpcResultCode GetSchedulerStatus([out] RpcSchedulerStatus* schedulerStatus);
+
+    // Enables or disables scheduled scanning.
+    RpcResultCode SetSchedulerEnabled(
+        [in] long enabled,
+        [out] RpcSchedulerStatus* schedulerStatus);
+
+    // Returns monitoring status and currently tracked directories.
+    RpcResultCode GetMonitoringStatus([out] RpcMonitoringStatus* monitoringStatus);
+
+    // Returns the monitored directories in the same status shape.
+    RpcResultCode GetMonitoredDirectories([out] RpcMonitoringStatus* monitoringStatus);
+
+    // Adds one monitored directory and refreshes watchers.
+    RpcResultCode AddMonitoredDirectory(
+        [in, string] const wchar_t* path,
+        [out] RpcMonitoringStatus* monitoringStatus);
+
+    // Removes one monitored directory and refreshes watchers.
+    RpcResultCode RemoveMonitoredDirectory(
+        [in, string] const wchar_t* path,
+        [out] RpcMonitoringStatus* monitoringStatus);
 }
