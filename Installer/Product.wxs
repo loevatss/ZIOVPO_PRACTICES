@@ -1,0 +1,96 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="ZIOVPO Antivirus"
+    Manufacturer="ZIOVPO"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="{3A3A36C8-48F2-40A0-9F10-D39B9D68B381}"
+    Scope="perMachine">
+    <SummaryInformation Description="ZIOVPO Antivirus installer" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of ZIOVPO Antivirus is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="ProductIcon.ico" SourceFile="..\Antivirus\Antivirus.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon.ico" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="ZIOVPO Antivirus" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="PROGRAMDATAROOT" Name="Antivirus">
+        <Directory Id="DATABASESFOLDER" Name="Databases" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="ZIOVPO Antivirus" Level="1">
+      <ComponentGroupRef Id="AppComponents" />
+      <ComponentRef Id="ProgramDataComponent" />
+      <ComponentRef Id="InstallRootComponent" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="TrayAppComponent" Guid="{22CB25BA-3CDD-455F-8F32-083DE9152EC2}">
+        <File Id="TrayAppExe" Source="$(var.StageDir)\TrayApp.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="TrayServiceComponent" Guid="{7F11C9F1-6D84-4A1A-B35E-66B5F0C7F1C1}">
+        <File Id="TrayServiceExe" Source="$(var.StageDir)\TrayService.exe" KeyPath="yes" />
+        <ServiceInstall
+          Id="InstallAntivirusService"
+          Name="AntivirusService"
+          DisplayName="ZIOVPO Antivirus Service"
+          Description="ZIOVPO Antivirus background scanning and tray launcher service."
+          Start="auto"
+          Type="ownProcess"
+          ErrorControl="normal"
+          Account="LocalSystem" />
+        <ServiceControl
+          Id="ControlAntivirusService"
+          Name="AntivirusService"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
+      </Component>
+
+      <Component Id="InstallRootComponent" Guid="{9B8D9FC0-EBD9-48C4-9BE6-ED20E71FF0FD}">
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\ZIOVPO\Antivirus"
+          Name="InstallDir"
+          Type="string"
+          Value="[INSTALLFOLDER]"
+          KeyPath="yes" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <DirectoryRef Id="DATABASESFOLDER">
+      <Component Id="ProgramDataComponent" Guid="{AD6AF849-C727-49B8-AF5A-B49857EF91F0}">
+        <CreateFolder />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\ZIOVPO\Antivirus"
+          Name="DatabaseDir"
+          Type="string"
+          Value="[DATABASESFOLDER]"
+          KeyPath="yes" />
+        <RemoveFile Id="RemoveAvdbFiles" Name="*.avdb" On="uninstall" />
+        <RemoveFile Id="RemoveTempDatabase" Name="database.tmp" On="uninstall" />
+        <RemoveFolder Id="RemoveDatabasesFolder" Directory="DATABASESFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveProgramDataRoot" Directory="PROGRAMDATAROOT" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="AppComponents">
+      <ComponentRef Id="TrayAppComponent" />
+      <ComponentRef Id="TrayServiceComponent" />
+    </ComponentGroup>
+  </Fragment>
+</Wix>

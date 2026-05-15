@@ -1,0 +1,32 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
+    <InstallerVersion Condition="'$(InstallerVersion)' == ''">1.0.0</InstallerVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <OutputName>ZIOVPOAntivirusSetup</OutputName>
+    <OutputType>Bundle</OutputType>
+    <OutputPath>$(MSBuildThisFileDirectory)bin\$(Configuration)\$(Platform)\</OutputPath>
+    <IntermediateOutputPath>$(MSBuildThisFileDirectory)obj\$(MSBuildProjectName)\$(Configuration)\$(Platform)\</IntermediateOutputPath>
+    <StageRoot>$(MSBuildThisFileDirectory)artifacts\staging</StageRoot>
+    <BundleDepsDir>$(StageRoot)\deps</BundleDepsDir>
+    <MsiPath>$(MSBuildThisFileDirectory)bin\$(Configuration)\$(Platform)\ZIOVPOAntivirus.msi</MsiPath>
+    <VCRedistPath>$(BundleDepsDir)\VC_redist.x64.exe</VCRedistPath>
+    <DefineConstants>$(DefineConstants);ProductVersion=$(InstallerVersion);MsiPath=$(MsiPath);VCRedistPath=$(VCRedistPath)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Bundle.wxs" />
+    <PackageReference Include="WixToolset.BootstrapperApplications.wixext" Version="5.0.2" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
+  </ItemGroup>
+
+  <Target Name="PrepareBundleArtifacts" BeforeTargets="BeforeBuild">
+    <Exec
+      Command='powershell -NoProfile -ExecutionPolicy Bypass -File "$(MSBuildThisFileDirectory)scripts\collect-artifacts.ps1" -RepoRoot "$(MSBuildThisFileDirectory).." -StageRoot "$(MSBuildThisFileDirectory)artifacts\staging" -DownloadVcRedist' />
+    <MSBuild
+      Projects="$(MSBuildThisFileDirectory)TrayInstaller.wixproj"
+      Targets="Restore;Build"
+      Properties="Configuration=$(Configuration);Platform=$(Platform);InstallerVersion=$(InstallerVersion)" />
+  </Target>
+</Project>

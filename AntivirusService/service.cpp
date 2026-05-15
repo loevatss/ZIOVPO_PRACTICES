@@ -4,16 +4,35 @@
 #include <wtsapi32.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <cwchar>
 #include <cwctype>
+#include <filesystem>
+#include <limits>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include "AntivirusDatabaseUpdater.h"
+#include "AntivirusEngine.h"
+#include "AntivirusEngineSelfTest.h"
+#include "AntivirusScanService.h"
 #include "AntivirusRpcControl.h"
+#include "ProcessProtection.h"
 #include "ServiceCommon.h"
+#include "ServiceProtection.h"
+#include "WebApiIntegration.h"
+
+void RequestConfirmedServiceStop();
 
 namespace
 {
@@ -23,19 +42,1331 @@ struct GuiProcessInfo
     HANDLE processHandle = nullptr;
 };
 
+struct DirectoryMonitorState
+{
+    std::filesystem::path path;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    std::thread thread;
+    std::atomic<bool> stopRequested = false;
+};
+
+struct ScheduledScanState
+{
+    bool enabled = true;
+    bool running = false;
+    std::string lastRunUtc;
+    std::string lastStatus = "idle";
+    antivirus::service::DirectoryScanResult lastResult;
+};
+
+struct MonitoringRuntimeState
+{
+    bool enabled = true;
+    std::vector<std::filesystem::path> directories;
+    std::string lastEventUtc;
+    std::string lastStatus = "idle";
+};
+
 SERVICE_STATUS_HANDLE g_serviceStatusHandle = nullptr;
 SERVICE_STATUS g_serviceStatus{};
 volatile LONG g_rpcStopRequested = 0;
 constexpr DWORD kServiceStartTimeoutMs = 30000;
 constexpr DWORD kServiceStatusPollIntervalMs = 250;
+constexpr DWORD kGuiSessionMonitorIntervalMs = 15000;
+constexpr bool kDenyAdministratorsProcessTerminate = true;
+constexpr bool kDenyServiceStopForUsers = false;
+constexpr bool kDenyServiceStopForAdministrators = false;
+constexpr bool kRestrictServiceSecurityWritesForAdministrators = false;
 
 std::mutex g_guiProcessesMutex;
 std::unordered_map<DWORD, GuiProcessInfo> g_guiProcessesBySession;
 std::wstring g_guiExecutablePath;
+std::thread g_guiSessionMonitorThread;
+std::atomic<bool> g_guiSessionMonitorStopRequested = false;
+antivirus::web::InMemorySession g_webSession;
+// antivirus::web::ApiClient g_webApiClient(L"https://10.11.134.140:8443/");
+antivirus::web::ApiClient g_webApiClient(L"https://192.168.1.56:8443/");
+antivirus::engine::AvSignatureDatabase g_avSignatureDatabase;
+std::mutex g_avDatabaseMutex;
+bool g_avDatabaseLoaded = false;
+std::string g_avDatabaseSourceName = "none";
+std::string g_avLastUpdateStatus = "not started";
+std::string g_avLastSuccessfulLoadUtc;
+std::string g_avLastSuccessfulManifestVerificationUtc;
+size_t g_avSkippedRecordCount = 0;
+std::string g_avVerifierName = "DEMO-HMAC-SHA256";
+std::atomic<bool> g_forceDatabaseUpdateRequested = false;
+std::mutex g_avMaintenanceMutex;
+std::vector<std::array<uint8_t, 16>> g_pendingDatabaseRepairIds;
+std::mutex g_webStateMutex;
+std::thread g_webWorkerThread;
+std::atomic<bool> g_webWorkerStopRequested = false;
+bool g_antivirusBackgroundTasksRunning = false;
+std::thread g_antivirusWorkerThread;
+std::atomic<bool> g_antivirusWorkerStopRequested = false;
+std::vector<std::unique_ptr<DirectoryMonitorState>> g_directoryMonitors;
+std::mutex g_directoryMonitorsMutex;
+std::mutex g_schedulerMutex;
+ScheduledScanState g_scheduledScanState;
+std::mutex g_monitoringMutex;
+MonitoringRuntimeState g_monitoringState;
+std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> g_monitoringDebounceByPath;
+std::string g_authenticatedUsername;
+
+struct LicenseRequestContext
+{
+    bool hasContext = false;
+    long long productId = 0;
+    std::string deviceMac;
+};
+
+LicenseRequestContext g_licenseRequestContext;
+constexpr DWORD kWebWorkerPollIntervalMs = 1000;
+constexpr DWORD kAntivirusWorkerPollIntervalMs = 1000;
+constexpr auto kDatabaseUpdateInterval = std::chrono::minutes(15);
+constexpr auto kScheduledScanInterval = std::chrono::hours(12);
+constexpr auto kMonitorDebounceInterval = std::chrono::seconds(2);
+
+// Converts UTF-16 text to UTF-8 for HTTP API calls.
+std::string ToUtf8(const wchar_t* text)
+{
+    if (text == nullptr || *text == L'\0')
+    {
+        return {};
+    }
+
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1)
+    {
+        return {};
+    }
+
+    std::string utf8(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8.data(), size, nullptr, nullptr);
+    utf8.resize(static_cast<size_t>(size - 1));
+    return utf8;
+}
+
+// Converts UTF-8 text to UTF-16 for RPC output fields.
+std::wstring ToWide(const std::string& text)
+{
+    if (text.empty())
+    {
+        return {};
+    }
+
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (size <= 1)
+    {
+        return {};
+    }
+
+    std::wstring wide(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), size);
+    wide.resize(static_cast<size_t>(size - 1));
+    return wide;
+}
+
+// Returns current UTC time as an ISO-8601 text used in runtime diagnostics.
+std::string BuildCurrentUtcTimestamp()
+{
+    return antivirus::engine::BuildCurrentUtcReleaseDate();
+}
+
+// Reads one process environment variable as UTF-8.
+std::string ReadEnvironmentVariableUtf8(const wchar_t* name)
+{
+    if (name == nullptr || *name == L'\0')
+    {
+        return {};
+    }
+
+    DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required == 0)
+    {
+        return {};
+    }
+
+    std::vector<wchar_t> buffer(required, L'\0');
+    if (GetEnvironmentVariableW(name, buffer.data(), required) == 0)
+    {
+        return {};
+    }
+
+    return ToUtf8(buffer.data());
+}
+
+// Copies the current in-memory antivirus database so long scans do not hold the mutex.
+bool SnapshotAntivirusDatabase(antivirus::engine::AvSignatureDatabase* database)
+{
+    if (database == nullptr)
+    {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    if (!g_avDatabaseLoaded)
+    {
+        return false;
+    }
+
+    *database = g_avSignatureDatabase;
+    return true;
+}
+
+// Replaces global in-memory database state after startup load/update/rollback.
+void UpdateLoadedDatabaseState(
+    const antivirus::engine::AvSignatureDatabase& database,
+    bool loaded,
+    const std::string& sourceName,
+    const std::string& lastUpdateStatus,
+    size_t skippedRecordCount = 0,
+    const std::string& verifierName = "DEMO-HMAC-SHA256")
+{
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    g_avSignatureDatabase = database;
+    g_avDatabaseLoaded = loaded;
+    g_avDatabaseSourceName = sourceName;
+    g_avLastUpdateStatus = lastUpdateStatus;
+    g_avSkippedRecordCount = skippedRecordCount;
+    g_avVerifierName = verifierName;
+    if (loaded)
+    {
+        g_avLastSuccessfulLoadUtc = BuildCurrentUtcTimestamp();
+        g_avLastSuccessfulManifestVerificationUtc = g_avLastSuccessfulLoadUtc;
+    }
+}
+
+// Builds updater parameters from the current API session and ProgramData paths.
+std::optional<antivirus::service::AvDatabaseUpdaterContext> BuildDatabaseUpdaterContext()
+{
+    const antivirus::web::AuthTokens tokens = g_webSession.GetAuthTokens();
+    antivirus::service::AvDatabaseUpdaterContext context;
+    context.apiBaseUrl = g_webApiClient.GetBaseUrl();
+    context.accessToken = tokens.accessToken;
+    context.paths = antivirus::storage::ResolveDefaultDatabasePaths();
+    return context;
+}
+
+// Copies UTF-8 text into a fixed RPC wide-char buffer.
+template <size_t BufferSize>
+void CopyUtf8ToRpcBuffer(const std::string& source, wchar_t (&target)[BufferSize])
+{
+    static_assert(BufferSize > 0);
+    std::fill(std::begin(target), std::end(target), L'\0');
+
+    const std::wstring wide = ToWide(source);
+    if (wide.empty())
+    {
+        return;
+    }
+
+    const size_t count = std::min(static_cast<size_t>(BufferSize - 1), wide.size());
+    std::wmemcpy(target, wide.c_str(), count);
+    target[count] = L'\0';
+}
+
+// Copies UTF-16 text into a fixed RPC wide-char buffer.
+template <size_t BufferSize>
+void CopyWideToRpcBuffer(const std::wstring& source, wchar_t (&target)[BufferSize])
+{
+    static_assert(BufferSize > 0);
+    std::fill(std::begin(target), std::end(target), L'\0');
+
+    const size_t count = std::min(static_cast<size_t>(BufferSize - 1), source.size());
+    if (count > 0)
+    {
+        std::wmemcpy(target, source.c_str(), count);
+    }
+    target[count] = L'\0';
+}
+
+// Parses Java OffsetDateTime string into system_clock time point.
+bool TryParseIsoDateTimeUtc(
+    const std::string& isoDateTime,
+    std::chrono::system_clock::time_point* outTimePoint)
+{
+    if (outTimePoint == nullptr || isoDateTime.size() < 19)
+    {
+        return false;
+    }
+
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+
+    if (::sscanf_s(
+        isoDateTime.c_str(),
+        "%4d-%2d-%2dT%2d:%2d:%2d",
+        &year,
+        &month,
+        &day,
+        &hour,
+        &minute,
+        &second) != 6)
+    {
+        return false;
+    }
+
+    std::tm tmUtc{};
+    tmUtc.tm_year = year - 1900;
+    tmUtc.tm_mon = month - 1;
+    tmUtc.tm_mday = day;
+    tmUtc.tm_hour = hour;
+    tmUtc.tm_min = minute;
+    tmUtc.tm_sec = second;
+
+    time_t baseUnixTime = _mkgmtime(&tmUtc);
+    if (baseUnixTime == static_cast<time_t>(-1))
+    {
+        return false;
+    }
+
+    int offsetSign = 0;
+    int offsetHour = 0;
+    int offsetMinute = 0;
+    const size_t tzPosition = isoDateTime.find_first_of("Z+-", 19);
+    if (tzPosition != std::string::npos)
+    {
+        const char tzMarker = isoDateTime[tzPosition];
+        if (tzMarker == '+')
+        {
+            offsetSign = 1;
+        }
+        else if (tzMarker == '-')
+        {
+            offsetSign = -1;
+        }
+
+        if (offsetSign != 0 && tzPosition + 5 < isoDateTime.size())
+        {
+            const std::string hourText = isoDateTime.substr(tzPosition + 1, 2);
+            const std::string minuteText = isoDateTime.substr(tzPosition + 4, 2);
+            offsetHour = std::atoi(hourText.c_str());
+            offsetMinute = std::atoi(minuteText.c_str());
+        }
+    }
+
+    const int totalOffsetSeconds = offsetSign * ((offsetHour * 60 * 60) + (offsetMinute * 60));
+    const time_t utcUnixTime = baseUnixTime - totalOffsetSeconds;
+    *outTimePoint = std::chrono::system_clock::from_time_t(utcUnixTime);
+    return true;
+}
+
+// Maps authentication API error to RPC result code.
+RpcResultCode MapAuthErrorToRpcCode(const antivirus::web::AuthError& error)
+{
+    if (error.httpStatus == 401)
+    {
+        return RPC_RESULT_AUTH_FAILED;
+    }
+
+    if (error.httpStatus == 400)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    if (error.httpStatus == 0)
+    {
+        return RPC_RESULT_NETWORK_ERROR;
+    }
+
+    return RPC_RESULT_INTERNAL_ERROR;
+}
+
+// Maps license API error to RPC result code.
+RpcResultCode MapLicenseErrorToRpcCode(const antivirus::web::LicenseError& error)
+{
+    if (error.httpStatus == 401)
+    {
+        return RPC_RESULT_NOT_AUTHENTICATED;
+    }
+
+    if (error.httpStatus == 400)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    if (error.httpStatus == 404)
+    {
+        return RPC_RESULT_NO_LICENSE;
+    }
+
+    if (error.httpStatus == 0)
+    {
+        return RPC_RESULT_NETWORK_ERROR;
+    }
+
+    return RPC_RESULT_INTERNAL_ERROR;
+}
+
+// Clears all auth and license state that must exist only in memory.
+void ClearAuthAndLicenseState()
+{
+    std::lock_guard<std::mutex> guard(g_webStateMutex);
+    g_webSession.Clear();
+    g_licenseRequestContext = LicenseRequestContext{};
+    g_authenticatedUsername.clear();
+    g_antivirusBackgroundTasksRunning = false;
+}
+
+// Returns current centralized license state for antivirus operations.
+RpcResultCode EvaluateLicenseState()
+{
+    if (!g_webSession.HasLicenseTicket())
+    {
+        return RPC_RESULT_NO_LICENSE;
+    }
+
+    const antivirus::web::LicenseState licenseState = g_webSession.GetLicenseState();
+    if (!licenseState.hasLicense)
+    {
+        return RPC_RESULT_NO_LICENSE;
+    }
+
+    if (licenseState.ticket.licenseBlocked)
+    {
+        return RPC_RESULT_LICENSE_BLOCKED;
+    }
+
+    if (licenseState.ticket.licenseExpirationDate.empty())
+    {
+        return RPC_RESULT_OK;
+    }
+
+    std::chrono::system_clock::time_point expirationTime{};
+    if (!TryParseIsoDateTimeUtc(licenseState.ticket.licenseExpirationDate, &expirationTime))
+    {
+        return RPC_RESULT_LICENSE_EXPIRED;
+    }
+
+    if (expirationTime <= std::chrono::system_clock::now())
+    {
+        return RPC_RESULT_LICENSE_EXPIRED;
+    }
+
+    return RPC_RESULT_OK;
+}
+
+// Applies centralized license check and starts/stops antivirus tasks.
+RpcResultCode EnsureValidLicenseForAntivirus()
+{
+    const RpcResultCode licenseCode = EvaluateLicenseState();
+    std::lock_guard<std::mutex> guard(g_webStateMutex);
+    g_antivirusBackgroundTasksRunning = (licenseCode == RPC_RESULT_OK);
+    return licenseCode;
+}
+
+// Converts RPC license code to a readable safe error string.
+std::string LicenseCodeToText(RpcResultCode code)
+{
+    switch (code)
+    {
+    case RPC_RESULT_NO_LICENSE:
+        return "NO_LICENSE";
+    case RPC_RESULT_LICENSE_EXPIRED:
+        return "LICENSE_EXPIRED";
+    case RPC_RESULT_LICENSE_BLOCKED:
+        return "LICENSE_BLOCKED";
+    default:
+        return {};
+    }
+}
+
+// Fills RPC auth info with safe data only.
+void FillRpcAuthInfo(RpcAuthInfo* authInfo)
+{
+    if (authInfo == nullptr)
+    {
+        return;
+    }
+
+    authInfo->authenticated = 0;
+    authInfo->hasUserId = 0;
+    authInfo->userId = 0;
+    std::fill(std::begin(authInfo->username), std::end(authInfo->username), L'\0');
+
+    if (!g_webSession.HasAuthTokens())
+    {
+        return;
+    }
+
+    authInfo->authenticated = 1;
+
+    antivirus::web::AuthUserInfo userInfo = g_webSession.GetAuthUserInfo();
+    std::string username = userInfo.username;
+    if (username.empty())
+    {
+        std::lock_guard<std::mutex> guard(g_webStateMutex);
+        username = g_authenticatedUsername;
+    }
+
+    CopyUtf8ToRpcBuffer(username, authInfo->username);
+    if (userInfo.id > 0)
+    {
+        authInfo->hasUserId = 1;
+        authInfo->userId = userInfo.id;
+    }
+}
+
+// Fills RPC license info with safe data only.
+void FillRpcLicenseInfo(RpcLicenseInfo* licenseInfo, RpcResultCode errorCode, const std::string& errorText)
+{
+    if (licenseInfo == nullptr)
+    {
+        return;
+    }
+
+    licenseInfo->hasLicense = 0;
+    licenseInfo->blocked = 0;
+    licenseInfo->errorCode = static_cast<long>(errorCode);
+    std::fill(std::begin(licenseInfo->expirationDate), std::end(licenseInfo->expirationDate), L'\0');
+    std::fill(std::begin(licenseInfo->error), std::end(licenseInfo->error), L'\0');
+
+    if (g_webSession.HasLicenseTicket())
+    {
+        const antivirus::web::LicenseState licenseState = g_webSession.GetLicenseState();
+        if (licenseState.hasLicense)
+        {
+            licenseInfo->hasLicense = 1;
+            licenseInfo->blocked = licenseState.ticket.licenseBlocked ? 1 : 0;
+            CopyUtf8ToRpcBuffer(licenseState.ticket.licenseExpirationDate, licenseInfo->expirationDate);
+        }
+    }
+
+    if (!errorText.empty())
+    {
+        CopyUtf8ToRpcBuffer(errorText, licenseInfo->error);
+    }
+}
+
+// Converts service scan status to the RPC status enum.
+RpcScanStatus ToRpcScanStatus(antivirus::service::FileScanStatus status)
+{
+    switch (status)
+    {
+    case antivirus::service::FileScanStatus::Infected:
+        return RPC_SCAN_STATUS_INFECTED;
+    case antivirus::service::FileScanStatus::Error:
+        return RPC_SCAN_STATUS_ERROR;
+    default:
+        return RPC_SCAN_STATUS_CLEAN;
+    }
+}
+
+// Fills one RPC scan result from the service scan model.
+void FillRpcScanFileResult(
+    const antivirus::service::FileScanResult& source,
+    RpcScanFileResult* target)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+
+    target->status = ToRpcScanStatus(source.status);
+    CopyWideToRpcBuffer(source.path.wstring(), target->path);
+    CopyUtf8ToRpcBuffer(antivirus::engine::ToString(source.objectType), target->objectType);
+    CopyUtf8ToRpcBuffer(source.recordId, target->recordId);
+    CopyUtf8ToRpcBuffer(source.message, target->message);
+}
+
+// Fills an RPC file result with an immediate service-side error.
+void FillRpcScanErrorResult(
+    const wchar_t* path,
+    const std::string& message,
+    RpcScanFileResult* target)
+{
+    antivirus::service::FileScanResult result;
+    result.status = antivirus::service::FileScanStatus::Error;
+    result.path = path != nullptr ? std::filesystem::path(path) : std::filesystem::path();
+    result.objectType = antivirus::engine::AvObjectType::Unknown;
+    result.message = message;
+    FillRpcScanFileResult(result, target);
+}
+
+// Fills the RPC directory aggregate and allocates the per-file result array.
+bool FillRpcScanDirectoryResult(
+    const antivirus::service::DirectoryScanResult& source,
+    RpcScanDirectoryResult* target)
+{
+    if (target == nullptr)
+    {
+        return false;
+    }
+
+    target->totalScanned = static_cast<hyper>(source.totalScanned);
+    target->infectedCount = static_cast<hyper>(source.infectedCount);
+    target->errorCount = static_cast<hyper>(source.errorCount);
+    target->resultCount = static_cast<long>(std::min<size_t>(
+        source.results.size(),
+        static_cast<size_t>(std::numeric_limits<long>::max())));
+    target->results = nullptr;
+
+    if (target->resultCount == 0)
+    {
+        return true;
+    }
+
+    const size_t bytesToAllocate = static_cast<size_t>(target->resultCount) * sizeof(RpcScanFileResult);
+    target->results = static_cast<RpcScanFileResult*>(std::malloc(bytesToAllocate));
+    if (target->results == nullptr)
+    {
+        target->resultCount = 0;
+        return false;
+    }
+
+    for (long i = 0; i < target->resultCount; ++i)
+    {
+        FillRpcScanFileResult(source.results[static_cast<size_t>(i)], &target->results[i]);
+    }
+    return true;
+}
+
+// Fills current in-memory antivirus database metadata for RPC callers.
+void FillRpcAvDatabaseInfo(
+    const antivirus::service::AvDatabaseRuntimeInfo& source,
+    RpcAvDatabaseInfo* target)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+
+    target->loaded = source.loaded ? 1 : 0;
+    target->recordCount = static_cast<hyper>(source.databaseInfo.recordCount);
+    CopyUtf8ToRpcBuffer(source.databaseInfo.releaseDateUtc, target->releaseDate);
+    CopyUtf8ToRpcBuffer(source.sourceName, target->source);
+    CopyUtf8ToRpcBuffer(source.lastUpdateStatus, target->lastUpdateStatus);
+    CopyUtf8ToRpcBuffer(source.lastSuccessfulLoadUtc, target->lastSuccessfulLoadUtc);
+    CopyUtf8ToRpcBuffer(source.lastSuccessfulManifestVerificationUtc, target->lastManifestVerificationUtc);
+    target->skippedRecordCount = static_cast<hyper>(source.skippedRecordCount);
+    CopyUtf8ToRpcBuffer(source.verifierName, target->verifier);
+    target->schedulerEnabled = source.schedulerEnabled ? 1 : 0;
+    target->monitoringEnabled = source.monitoringEnabled ? 1 : 0;
+    CopyUtf8ToRpcBuffer(source.schedulerStatus, target->schedulerStatus);
+    CopyUtf8ToRpcBuffer(source.monitoringStatus, target->monitoringStatus);
+}
+
+void FillRpcSchedulerStatus(RpcSchedulerStatus* target)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+
+    *target = RpcSchedulerStatus{};
+    std::lock_guard<std::mutex> guard(g_schedulerMutex);
+    target->enabled = g_scheduledScanState.enabled ? 1 : 0;
+    target->running = g_scheduledScanState.running ? 1 : 0;
+    target->totalScanned = static_cast<hyper>(g_scheduledScanState.lastResult.totalScanned);
+    target->infectedCount = static_cast<hyper>(g_scheduledScanState.lastResult.infectedCount);
+    target->errorCount = static_cast<hyper>(g_scheduledScanState.lastResult.errorCount);
+    CopyUtf8ToRpcBuffer(g_scheduledScanState.lastRunUtc, target->lastRunUtc);
+    CopyUtf8ToRpcBuffer(g_scheduledScanState.lastStatus, target->lastStatus);
+}
+
+void FillRpcMonitoringStatus(RpcMonitoringStatus* target)
+{
+    if (target == nullptr)
+    {
+        return;
+    }
+
+    *target = RpcMonitoringStatus{};
+    std::lock_guard<std::mutex> guard(g_monitoringMutex);
+    target->enabled = g_monitoringState.enabled ? 1 : 0;
+    target->directoryCount = static_cast<hyper>(g_monitoringState.directories.size());
+    std::wstringstream directories;
+    for (size_t i = 0; i < g_monitoringState.directories.size(); ++i)
+    {
+        if (i != 0)
+        {
+            directories << L"; ";
+        }
+        directories << g_monitoringState.directories[i].wstring();
+    }
+    CopyWideToRpcBuffer(directories.str(), target->directories);
+    CopyUtf8ToRpcBuffer(g_monitoringState.lastEventUtc, target->lastEventUtc);
+    CopyUtf8ToRpcBuffer(g_monitoringState.lastStatus, target->lastStatus);
+}
+
+// Periodically refreshes tokens and license ticket in memory.
+void WebSessionWorkerLoop()
+{
+    while (!g_webWorkerStopRequested.load())
+    {
+        bool didWork = false;
+        const auto now = std::chrono::system_clock::now();
+
+        if (g_webSession.HasAuthTokens())
+        {
+            const antivirus::web::AuthTokens currentTokens = g_webSession.GetAuthTokens();
+            if (now >= currentTokens.nextRefreshAt)
+            {
+                didWork = true;
+                antivirus::web::AuthTokens refreshedTokens;
+                antivirus::web::AuthError refreshError;
+                if (g_webApiClient.RefreshTokens(currentTokens.refreshToken, &refreshedTokens, &refreshError))
+                {
+                    g_webSession.SetAuthTokens(std::move(refreshedTokens));
+                }
+                else
+                {
+                    ClearAuthAndLicenseState();
+                }
+            }
+        }
+
+        if (g_webSession.HasAuthTokens() && g_webSession.HasLicenseTicket())
+        {
+            const antivirus::web::LicenseState licenseState = g_webSession.GetLicenseState();
+            if (now >= licenseState.nextRefreshAt)
+            {
+                didWork = true;
+                antivirus::web::AuthTokens authTokens = g_webSession.GetAuthTokens();
+
+                LicenseRequestContext context;
+                {
+                    std::lock_guard<std::mutex> guard(g_webStateMutex);
+                    context = g_licenseRequestContext;
+                }
+
+                if (!context.hasContext)
+                {
+                    g_webSession.SetLicenseState(antivirus::web::LicenseState{});
+                }
+                else
+                {
+                    antivirus::web::LicenseState refreshedLicense;
+                    antivirus::web::LicenseError licenseError;
+                    if (g_webApiClient.CheckLicense(
+                        authTokens.accessToken,
+                        context.productId,
+                        context.deviceMac,
+                        &refreshedLicense,
+                        &licenseError))
+                    {
+                        g_webSession.SetLicenseState(std::move(refreshedLicense));
+                    }
+                    else
+                    {
+                        g_webSession.SetLicenseState(antivirus::web::LicenseState{});
+                    }
+                }
+
+                EnsureValidLicenseForAntivirus();
+            }
+        }
+        else if (!g_webSession.HasLicenseTicket())
+        {
+            std::lock_guard<std::mutex> guard(g_webStateMutex);
+            g_antivirusBackgroundTasksRunning = false;
+        }
+
+        if (!didWork)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kWebWorkerPollIntervalMs));
+        }
+    }
+}
+
+// Clears API session state in memory before service work starts.
+void InitializeWebApiLayer()
+{
+    ClearAuthAndLicenseState();
+    g_webWorkerStopRequested.store(false);
+    if (!g_webWorkerThread.joinable())
+    {
+        g_webWorkerThread = std::thread(WebSessionWorkerLoop);
+    }
+}
+
+// Clears API session state in memory before service exits.
+void ShutdownWebApiLayer()
+{
+    g_webWorkerStopRequested.store(true);
+    if (g_webWorkerThread.joinable())
+    {
+        g_webWorkerThread.join();
+    }
+
+    ClearAuthAndLicenseState();
+}
 
 DWORD RpcStatusToWin32(RPC_STATUS status)
 {
     return status == RPC_S_OK ? NO_ERROR : static_cast<DWORD>(status);
+}
+
+void DebugLogService(const wchar_t* format, ...)
+{
+    wchar_t message[1024]{};
+    va_list args;
+    va_start(args, format);
+    vswprintf_s(message, format, args);
+    va_end(args);
+
+    wchar_t buffer[1152]{};
+    swprintf_s(buffer, L"[AntivirusService] %ls\r\n", message);
+    OutputDebugStringW(buffer);
+}
+
+// Loads signed antivirus signatures into the service process memory.
+void InitializeAntivirusEngineLayer()
+{
+    antivirus::storage::AvDatabaseLoadResult loadResult;
+    antivirus::engine::AvSignatureDatabase database;
+    const bool loaded = antivirus::service::LoadServiceAntivirusDatabase(
+        database,
+        &loadResult);
+    const std::string sourceName = loaded ? antivirus::storage::ToString(loadResult.source) : "none";
+    const std::string lastUpdateStatus = loaded
+        ? "Startup load completed"
+        : (loadResult.message.empty() ? "Startup load failed" : loadResult.message);
+    UpdateLoadedDatabaseState(
+        database,
+        loaded,
+        sourceName,
+        lastUpdateStatus,
+        loadResult.skippedRecordCount,
+        "DEMO-HMAC-SHA256");
+    g_forceDatabaseUpdateRequested.store(!loaded || loadResult.source != antivirus::storage::AvDatabaseLoadSource::Main);
+    {
+        std::lock_guard<std::mutex> guard(g_avMaintenanceMutex);
+        g_pendingDatabaseRepairIds = loadResult.skippedRecordIds;
+    }
+
+    const antivirus::engine::AvDatabaseInfo info = database.GetInfo();
+    const std::wstring releaseDate = ToWide(info.releaseDateUtc);
+    DebugLogService(
+        L"Antivirus database loaded in memory: source=%S, release=%ls, records=%llu, skipped=%llu",
+        antivirus::storage::ToString(loadResult.source),
+        releaseDate.c_str(),
+        static_cast<unsigned long long>(info.recordCount),
+        static_cast<unsigned long long>(loadResult.skippedRecordCount));
+}
+
+// Clears in-memory antivirus signatures before the service process exits.
+void ShutdownAntivirusEngineLayer()
+{
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    g_avSignatureDatabase.Clear();
+    g_avDatabaseLoaded = false;
+    g_avDatabaseSourceName = "none";
+    g_avLastSuccessfulManifestVerificationUtc.clear();
+    g_avSkippedRecordCount = 0;
+    g_avVerifierName = "DEMO-HMAC-SHA256";
+    g_forceDatabaseUpdateRequested.store(false);
+    std::lock_guard<std::mutex> maintenanceGuard(g_avMaintenanceMutex);
+    g_pendingDatabaseRepairIds.clear();
+}
+
+// Executes a server update and swaps the in-memory database only after success/rollback load.
+void RunScheduledDatabaseUpdate(bool forceUpdate)
+{
+    UNREFERENCED_PARAMETER(forceUpdate);
+
+    const auto updaterContext = BuildDatabaseUpdaterContext();
+    if (!updaterContext.has_value())
+    {
+        return;
+    }
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        databaseSnapshot = antivirus::engine::AvSignatureDatabase();
+    }
+
+    antivirus::service::AvDatabaseUpdateResult updateResult;
+    antivirus::engine::AvSignatureDatabase updatedDatabase = databaseSnapshot;
+    const bool updated = antivirus::service::UpdateDatabaseFromServer(
+        *updaterContext,
+        forceUpdate,
+        updatedDatabase,
+        &updateResult);
+
+    if (updated || (updateResult.loadResult.loaded && updateResult.rolledBack))
+    {
+        UpdateLoadedDatabaseState(
+            updatedDatabase,
+            updateResult.loadResult.loaded,
+            updated ? (forceUpdate ? "forcedUpdate" : "updated") : antivirus::storage::ToString(updateResult.loadResult.source),
+            updateResult.message.empty() ? "Update finished" : updateResult.message,
+            updateResult.skippedRecordCount,
+            updated ? "SHA256withRSA" : g_avVerifierName);
+        std::lock_guard<std::mutex> maintenanceGuard(g_avMaintenanceMutex);
+        g_pendingDatabaseRepairIds.clear();
+    }
+    else if (!updateResult.message.empty())
+    {
+        std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+        g_avLastUpdateStatus = updateResult.message;
+    }
+
+    g_forceDatabaseUpdateRequested.store(false);
+}
+
+// Repairs skipped compact DB records through /api/binary/signatures/by-ids when the API session allows it.
+void RepairSkippedDatabaseRecords(const std::vector<std::array<uint8_t, 16>>& recordIds)
+{
+    if (recordIds.empty())
+    {
+        return;
+    }
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        return;
+    }
+
+    const auto updaterContext = BuildDatabaseUpdaterContext();
+    if (!updaterContext.has_value())
+    {
+        return;
+    }
+
+    antivirus::service::AvDatabaseUpdateResult updateResult;
+    antivirus::engine::AvSignatureDatabase repairedDatabase = databaseSnapshot;
+    const bool repaired = antivirus::service::RepairDamagedRecordsFromServer(
+        *updaterContext,
+        recordIds,
+        repairedDatabase,
+        &updateResult);
+    if (repaired || (updateResult.loadResult.loaded && updateResult.rolledBack))
+    {
+        UpdateLoadedDatabaseState(
+            repairedDatabase,
+            updateResult.loadResult.loaded,
+            repaired ? "updated" : antivirus::storage::ToString(updateResult.loadResult.source),
+            updateResult.message.empty() ? "Record repair finished" : updateResult.message,
+            updateResult.skippedRecordCount,
+            repaired ? "SHA256withRSA" : g_avVerifierName);
+    }
+}
+
+// Runs background database refresh and scheduled full-disk scans while the license allows AV work.
+void AntivirusWorkerLoop()
+{
+    auto nextDatabaseUpdateAt = std::chrono::system_clock::now() + kDatabaseUpdateInterval;
+    auto nextScheduledScanAt = std::chrono::system_clock::now() + kScheduledScanInterval;
+
+    while (!g_antivirusWorkerStopRequested.load())
+    {
+        const auto now = std::chrono::system_clock::now();
+        if (g_antivirusBackgroundTasksRunning)
+        {
+            if (g_forceDatabaseUpdateRequested.load() || now >= nextDatabaseUpdateAt)
+            {
+                RunScheduledDatabaseUpdate(g_forceDatabaseUpdateRequested.load());
+                nextDatabaseUpdateAt = std::chrono::system_clock::now() + kDatabaseUpdateInterval;
+            }
+
+            std::vector<std::array<uint8_t, 16>> repairIds;
+            {
+                std::lock_guard<std::mutex> guard(g_avMaintenanceMutex);
+                repairIds = g_pendingDatabaseRepairIds;
+                g_pendingDatabaseRepairIds.clear();
+            }
+            if (!repairIds.empty())
+            {
+                RepairSkippedDatabaseRecords(repairIds);
+            }
+
+            if (now >= nextScheduledScanAt)
+            {
+                bool schedulerEnabled = false;
+                {
+                    std::lock_guard<std::mutex> guard(g_schedulerMutex);
+                    schedulerEnabled = g_scheduledScanState.enabled && !g_scheduledScanState.running;
+                    if (schedulerEnabled)
+                    {
+                        g_scheduledScanState.running = true;
+                        g_scheduledScanState.lastStatus = "running";
+                    }
+                }
+
+                antivirus::engine::AvSignatureDatabase databaseSnapshot;
+                if (schedulerEnabled && SnapshotAntivirusDatabase(&databaseSnapshot))
+                {
+                    const antivirus::service::DirectoryScanResult scanResult =
+                        antivirus::service::ScanFixedDrives(databaseSnapshot);
+                    {
+                        std::lock_guard<std::mutex> guard(g_schedulerMutex);
+                        g_scheduledScanState.running = false;
+                        g_scheduledScanState.lastRunUtc = BuildCurrentUtcTimestamp();
+                        g_scheduledScanState.lastResult = scanResult;
+                        g_scheduledScanState.lastStatus =
+                            "finished: total=" + std::to_string(scanResult.totalScanned)
+                            + ", infected=" + std::to_string(scanResult.infectedCount)
+                            + ", errors=" + std::to_string(scanResult.errorCount);
+                    }
+                    DebugLogService(
+                        L"Scheduled fixed-drive scan finished: scanned=%llu infected=%llu errors=%llu",
+                        static_cast<unsigned long long>(scanResult.totalScanned),
+                        static_cast<unsigned long long>(scanResult.infectedCount),
+                        static_cast<unsigned long long>(scanResult.errorCount));
+                }
+                else if (schedulerEnabled)
+                {
+                    std::lock_guard<std::mutex> guard(g_schedulerMutex);
+                    g_scheduledScanState.running = false;
+                    g_scheduledScanState.lastRunUtc = BuildCurrentUtcTimestamp();
+                    g_scheduledScanState.lastStatus = "skipped: database is not loaded";
+                }
+
+                nextScheduledScanAt = std::chrono::system_clock::now() + kScheduledScanInterval;
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(kAntivirusWorkerPollIntervalMs));
+    }
+}
+
+// Starts the background antivirus worker.
+void StartAntivirusWorker()
+{
+    g_antivirusWorkerStopRequested.store(false);
+    if (!g_antivirusWorkerThread.joinable())
+    {
+        g_antivirusWorkerThread = std::thread(AntivirusWorkerLoop);
+    }
+}
+
+// Stops the background antivirus worker.
+void StopAntivirusWorker()
+{
+    g_antivirusWorkerStopRequested.store(true);
+    if (g_antivirusWorkerThread.joinable())
+    {
+        g_antivirusWorkerThread.join();
+    }
+}
+
+// Resolves initial monitored directories from env or a safe ProgramData fallback.
+std::vector<std::filesystem::path> ResolveConfiguredMonitoredDirectories()
+{
+    std::vector<std::filesystem::path> directories;
+    const std::string configured = ReadEnvironmentVariableUtf8(L"ANTIVIRUS_MONITOR_DIRS");
+    if (!configured.empty())
+    {
+        size_t begin = 0;
+        while (begin < configured.size())
+        {
+            size_t end = configured.find(';', begin);
+            if (end == std::string::npos)
+            {
+                end = configured.size();
+            }
+
+            const std::string part = configured.substr(begin, end - begin);
+            if (!part.empty())
+            {
+                directories.emplace_back(ToWide(part));
+            }
+
+            begin = end + 1;
+        }
+    }
+
+    if (directories.empty())
+    {
+        directories.push_back(antivirus::storage::ResolveDefaultDatabasePaths().mainDatabasePath.parent_path() / "Watch");
+    }
+
+    return directories;
+}
+
+void EnsureMonitoringStateInitialized()
+{
+    std::lock_guard<std::mutex> guard(g_monitoringMutex);
+    if (!g_monitoringState.directories.empty())
+    {
+        return;
+    }
+
+    g_monitoringState.directories = ResolveConfiguredMonitoredDirectories();
+    g_monitoringState.enabled = !g_monitoringState.directories.empty();
+    g_monitoringState.lastStatus = g_monitoringState.enabled
+        ? "configured"
+        : "disabled";
+}
+
+std::vector<std::filesystem::path> ResolveMonitoredDirectories()
+{
+    EnsureMonitoringStateInitialized();
+    std::lock_guard<std::mutex> guard(g_monitoringMutex);
+    return g_monitoringState.directories;
+}
+
+bool ShouldDebounceMonitoringPath(const std::filesystem::path& path)
+{
+    const std::wstring key = path.wstring();
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> guard(g_monitoringMutex);
+    const auto it = g_monitoringDebounceByPath.find(key);
+    if (it != g_monitoringDebounceByPath.end() && now - it->second < kMonitorDebounceInterval)
+    {
+        return true;
+    }
+
+    g_monitoringDebounceByPath[key] = now;
+    return false;
+}
+
+// Scans one changed file detected by the directory monitor.
+void ScanMonitoredFile(const std::filesystem::path& path)
+{
+    if (!g_antivirusBackgroundTasksRunning || ShouldDebounceMonitoringPath(path))
+    {
+        return;
+    }
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        return;
+    }
+
+    const antivirus::service::FileScanResult result = antivirus::service::ScanFilePath(path, databaseSnapshot);
+    {
+        std::lock_guard<std::mutex> guard(g_monitoringMutex);
+        g_monitoringState.lastEventUtc = BuildCurrentUtcTimestamp();
+        g_monitoringState.lastStatus = result.status == antivirus::service::FileScanStatus::Clean
+            ? "last event clean"
+            : result.message;
+    }
+    if (result.status != antivirus::service::FileScanStatus::Clean)
+    {
+        DebugLogService(
+            L"Directory monitor scan: path=%ls status=%d message=%S",
+            path.c_str(),
+            static_cast<int>(result.status),
+            result.message.c_str());
+    }
+}
+
+// Monitors one directory recursively and scans changed files without duplicating scanner logic.
+void DirectoryMonitorLoop(DirectoryMonitorState* monitor)
+{
+    if (monitor == nullptr)
+    {
+        return;
+    }
+
+    constexpr DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME
+        | FILE_NOTIFY_CHANGE_DIR_NAME
+        | FILE_NOTIFY_CHANGE_LAST_WRITE
+        | FILE_NOTIFY_CHANGE_CREATION;
+    std::array<uint8_t, 64 * 1024> buffer{};
+
+    monitor->handle = CreateFileW(
+        monitor->path.c_str(),
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (monitor->handle == INVALID_HANDLE_VALUE)
+    {
+        DebugLogService(L"Directory monitor cannot open %ls", monitor->path.c_str());
+        return;
+    }
+
+    while (!monitor->stopRequested.load())
+    {
+        DWORD bytesReturned = 0;
+        if (!ReadDirectoryChangesW(
+                monitor->handle,
+                buffer.data(),
+                static_cast<DWORD>(buffer.size()),
+                TRUE,
+                filter,
+                &bytesReturned,
+                nullptr,
+                nullptr))
+        {
+            if (monitor->stopRequested.load())
+            {
+                break;
+            }
+
+            Sleep(kServiceStatusPollIntervalMs);
+            continue;
+        }
+
+        size_t offset = 0;
+        while (offset + sizeof(FILE_NOTIFY_INFORMATION) <= bytesReturned)
+        {
+            const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer.data() + offset);
+            const std::wstring fileName(info->FileName, info->FileNameLength / sizeof(WCHAR));
+            if (info->Action == FILE_ACTION_ADDED
+                || info->Action == FILE_ACTION_MODIFIED
+                || info->Action == FILE_ACTION_RENAMED_NEW_NAME)
+            {
+                ScanMonitoredFile(monitor->path / fileName);
+            }
+
+            if (info->NextEntryOffset == 0)
+            {
+                break;
+            }
+
+            offset += info->NextEntryOffset;
+        }
+    }
+
+    if (monitor->handle != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(monitor->handle);
+        monitor->handle = INVALID_HANDLE_VALUE;
+    }
+}
+
+// Starts recursive directory monitors for the configured paths.
+void StartDirectoryMonitors()
+{
+    const std::vector<std::filesystem::path> directories = ResolveMonitoredDirectories();
+    std::lock_guard<std::mutex> monitorGuard(g_directoryMonitorsMutex);
+    g_directoryMonitors.clear();
+    for (const std::filesystem::path& path : directories)
+    {
+        std::error_code error;
+        std::filesystem::create_directories(path, error);
+        if (error)
+        {
+            DebugLogService(L"Directory monitor cannot create %ls", path.c_str());
+            std::lock_guard<std::mutex> statusGuard(g_monitoringMutex);
+            g_monitoringState.lastStatus = "cannot create monitored directory";
+            continue;
+        }
+
+        auto monitor = std::make_unique<DirectoryMonitorState>();
+        monitor->path = path;
+        monitor->thread = std::thread(DirectoryMonitorLoop, monitor.get());
+        g_directoryMonitors.push_back(std::move(monitor));
+    }
+
+    std::lock_guard<std::mutex> statusGuard(g_monitoringMutex);
+    g_monitoringState.enabled = !g_directoryMonitors.empty();
+    g_monitoringState.lastStatus = g_directoryMonitors.empty()
+        ? "disabled"
+        : "watching " + std::to_string(g_directoryMonitors.size()) + " directorie(s)";
+}
+
+// Stops all recursive directory monitors.
+void StopDirectoryMonitors()
+{
+    std::lock_guard<std::mutex> monitorGuard(g_directoryMonitorsMutex);
+    for (const auto& monitor : g_directoryMonitors)
+    {
+        monitor->stopRequested.store(true);
+        if (monitor->handle != INVALID_HANDLE_VALUE)
+        {
+            CancelIoEx(monitor->handle, nullptr);
+        }
+    }
+
+    for (const auto& monitor : g_directoryMonitors)
+    {
+        if (monitor->thread.joinable())
+        {
+            monitor->thread.join();
+        }
+    }
+
+    g_directoryMonitors.clear();
+}
+
+bool AddMonitoredDirectoryPath(const std::filesystem::path& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    EnsureMonitoringStateInitialized();
+    {
+        std::lock_guard<std::mutex> guard(g_monitoringMutex);
+        const auto exists = std::find(
+            g_monitoringState.directories.begin(),
+            g_monitoringState.directories.end(),
+            path);
+        if (exists != g_monitoringState.directories.end())
+        {
+            g_monitoringState.enabled = true;
+            g_monitoringState.lastStatus = "directory already monitored";
+            return true;
+        }
+
+        g_monitoringState.directories.push_back(path);
+        g_monitoringState.enabled = true;
+        g_monitoringState.lastStatus = "directory added";
+    }
+
+    StopDirectoryMonitors();
+    StartDirectoryMonitors();
+    return true;
+}
+
+bool RemoveMonitoredDirectoryPath(const std::filesystem::path& path)
+{
+    if (path.empty())
+    {
+        return false;
+    }
+
+    EnsureMonitoringStateInitialized();
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> guard(g_monitoringMutex);
+        auto it = std::remove(
+            g_monitoringState.directories.begin(),
+            g_monitoringState.directories.end(),
+            path);
+        removed = it != g_monitoringState.directories.end();
+        g_monitoringState.directories.erase(it, g_monitoringState.directories.end());
+        g_monitoringState.enabled = !g_monitoringState.directories.empty();
+        g_monitoringState.lastStatus = removed ? "directory removed" : "directory not found";
+    }
+
+    StopDirectoryMonitors();
+    StartDirectoryMonitors();
+    return removed;
+}
+
+// Writes service protection diagnostics through the service logger.
+void DebugLogServiceProtection(const wchar_t* message)
+{
+    DebugLogService(L"%ls", message);
+}
+
+
+// Применяет user-mode защиту к process object службы и к service object.
+void HardenRunningServiceObjects()
+{
+    antivirus::protection::ProcessProtectionPolicy processPolicy{};
+    processPolicy.denyBuiltinAdministratorsTerminate = kDenyAdministratorsProcessTerminate;
+    if (!antivirus::protection::HardenCurrentProcess(processPolicy))
+    {
+        DebugLogServiceProtection(L"service process hardening failed; service keeps running");
+    }
+
+    antivirus::protection::ServiceProtectionPolicy servicePolicy{};
+    servicePolicy.denyBuiltinUsersStop = kDenyServiceStopForUsers;
+    servicePolicy.denyBuiltinAdministratorsStop = kDenyServiceStopForAdministrators;
+    if (!antivirus::protection::HardenServiceObject(antivirus::common::kServiceName, servicePolicy))
+    {
+        DebugLogServiceProtection(L"service object hardening failed; service keeps running");
+    }
+
+    UNREFERENCED_PARAMETER(kRestrictServiceSecurityWritesForAdministrators);
 }
 
 void ReportServiceStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint)
@@ -48,7 +1379,9 @@ void ReportServiceStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint
     g_serviceStatus.dwServiceSpecificExitCode = 0;
     g_serviceStatus.dwWaitHint = waitHint;
     g_serviceStatus.dwControlsAccepted =
-        currentState == SERVICE_RUNNING ? SERVICE_ACCEPT_SESSIONCHANGE : 0;
+        currentState == SERVICE_RUNNING
+        ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE)
+        : 0;
 
     if (currentState == SERVICE_START_PENDING)
     {
@@ -84,7 +1417,7 @@ std::wstring ResolveGuiExecutablePath()
     }
 
     std::wstring directoryPath = ExtractDirectory(modulePath);
-    return directoryPath + L"\\Antivirus.exe";
+    return directoryPath + L"\\" + antivirus::common::kGuiBinaryName;
 }
 
 bool FileExists(const std::wstring& path)
@@ -92,6 +1425,113 @@ bool FileExists(const std::wstring& path)
     const DWORD attributes = GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES
         && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+const wchar_t* SessionStateName(WTS_CONNECTSTATE_CLASS state)
+{
+    switch (state)
+    {
+    case WTSActive:
+        return L"WTSActive";
+    case WTSConnected:
+        return L"WTSConnected";
+    case WTSConnectQuery:
+        return L"WTSConnectQuery";
+    case WTSShadow:
+        return L"WTSShadow";
+    case WTSDisconnected:
+        return L"WTSDisconnected";
+    case WTSIdle:
+        return L"WTSIdle";
+    case WTSListen:
+        return L"WTSListen";
+    case WTSReset:
+        return L"WTSReset";
+    case WTSDown:
+        return L"WTSDown";
+    case WTSInit:
+        return L"WTSInit";
+    default:
+        return L"Unknown";
+    }
+}
+
+const wchar_t* SessionChangeEventName(DWORD eventType)
+{
+    switch (eventType)
+    {
+    case WTS_CONSOLE_CONNECT:
+        return L"WTS_CONSOLE_CONNECT";
+    case WTS_CONSOLE_DISCONNECT:
+        return L"WTS_CONSOLE_DISCONNECT";
+    case WTS_REMOTE_CONNECT:
+        return L"WTS_REMOTE_CONNECT";
+    case WTS_REMOTE_DISCONNECT:
+        return L"WTS_REMOTE_DISCONNECT";
+    case WTS_SESSION_LOGON:
+        return L"WTS_SESSION_LOGON";
+    case WTS_SESSION_LOGOFF:
+        return L"WTS_SESSION_LOGOFF";
+    case WTS_SESSION_LOCK:
+        return L"WTS_SESSION_LOCK";
+    case WTS_SESSION_UNLOCK:
+        return L"WTS_SESSION_UNLOCK";
+    case WTS_SESSION_REMOTE_CONTROL:
+        return L"WTS_SESSION_REMOTE_CONTROL";
+    case WTS_SESSION_CREATE:
+        return L"WTS_SESSION_CREATE";
+    case WTS_SESSION_TERMINATE:
+        return L"WTS_SESSION_TERMINATE";
+    default:
+        return L"Unknown";
+    }
+}
+
+bool IsInteractiveSessionState(WTS_CONNECTSTATE_CLASS state)
+{
+    return state == WTSActive || state == WTSConnected;
+}
+
+bool QuerySessionState(DWORD sessionId, WTS_CONNECTSTATE_CLASS& state)
+{
+    LPWSTR stateBuffer = nullptr;
+    DWORD bytesReturned = 0;
+    if (!WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            sessionId,
+            WTSConnectState,
+            &stateBuffer,
+            &bytesReturned))
+    {
+        const DWORD error = GetLastError();
+        DebugLogService(
+            L"QuerySessionState: session=%lu WTSQuerySessionInformationW failed, error=%lu",
+            sessionId,
+            error);
+        return false;
+    }
+
+    if (stateBuffer == nullptr || bytesReturned < sizeof(WTS_CONNECTSTATE_CLASS))
+    {
+        DebugLogService(
+            L"QuerySessionState: session=%lu returned invalid WTSConnectState buffer, bytes=%lu",
+            sessionId,
+            bytesReturned);
+        if (stateBuffer != nullptr)
+        {
+            WTSFreeMemory(stateBuffer);
+        }
+        return false;
+    }
+
+    state = *reinterpret_cast<WTS_CONNECTSTATE_CLASS*>(stateBuffer);
+    WTSFreeMemory(stateBuffer);
+
+    DebugLogService(
+        L"QuerySessionState: session=%lu state=%ls",
+        sessionId,
+        SessionStateName(state));
+    return true;
 }
 
 std::wstring QuotePathForScm(const std::wstring& path)
@@ -204,7 +1644,7 @@ bool EnsureServiceInstalledAndConfigured(SC_HANDLE scmHandle, SC_HANDLE& service
         serviceHandle = CreateServiceW(
             scmHandle,
             antivirus::common::kServiceName,
-            antivirus::common::kServiceName,
+            antivirus::common::kServiceDisplayName,
             desiredAccess,
             SERVICE_WIN32_OWN_PROCESS,
             SERVICE_DEMAND_START,
@@ -365,6 +1805,18 @@ void CleanupExitedGuiProcessesLocked()
 {
     for (auto it = g_guiProcessesBySession.begin(); it != g_guiProcessesBySession.end();)
     {
+        const DWORD sessionId = it->first;
+        const DWORD processId = it->second.processId;
+        if (it->second.processHandle == nullptr)
+        {
+            DebugLogService(
+                L"CleanupExitedGuiProcessesLocked: session=%lu pid=%lu has null process handle; removing",
+                sessionId,
+                processId);
+            it = g_guiProcessesBySession.erase(it);
+            continue;
+        }
+
         const DWORD waitResult = WaitForSingleObject(it->second.processHandle, 0);
         if (waitResult == WAIT_TIMEOUT)
         {
@@ -372,6 +1824,11 @@ void CleanupExitedGuiProcessesLocked()
             continue;
         }
 
+        DebugLogService(
+            L"CleanupExitedGuiProcessesLocked: session=%lu pid=%lu is not alive, wait=%lu; removing",
+            sessionId,
+            processId,
+            waitResult);
         CloseHandle(it->second.processHandle);
         it = g_guiProcessesBySession.erase(it);
     }
@@ -382,15 +1839,37 @@ bool IsGuiRunningInSessionLocked(DWORD sessionId)
     auto it = g_guiProcessesBySession.find(sessionId);
     if (it == g_guiProcessesBySession.end())
     {
+        DebugLogService(
+            L"IsGuiRunningInSessionLocked: session=%lu has no tracked GUI process",
+            sessionId);
+        return false;
+    }
+
+    if (it->second.processHandle == nullptr)
+    {
+        DebugLogService(
+            L"IsGuiRunningInSessionLocked: session=%lu pid=%lu has null process handle; removing",
+            sessionId,
+            it->second.processId);
+        g_guiProcessesBySession.erase(it);
         return false;
     }
 
     const DWORD waitResult = WaitForSingleObject(it->second.processHandle, 0);
     if (waitResult == WAIT_TIMEOUT)
     {
+        DebugLogService(
+            L"IsGuiRunningInSessionLocked: session=%lu pid=%lu is alive",
+            sessionId,
+            it->second.processId);
         return true;
     }
 
+    DebugLogService(
+        L"IsGuiRunningInSessionLocked: session=%lu pid=%lu is dead, wait=%lu; removing",
+        sessionId,
+        it->second.processId,
+        waitResult);
     CloseHandle(it->second.processHandle);
     g_guiProcessesBySession.erase(it);
     return false;
@@ -410,10 +1889,18 @@ bool TrackGuiProcess(DWORD sessionId, DWORD processId, HANDLE processHandle)
 
     if (IsGuiRunningInSessionLocked(sessionId))
     {
+        DebugLogService(
+            L"TrackGuiProcess: session=%lu pid=%lu not tracked because another GUI is alive",
+            sessionId,
+            processId);
         return false;
     }
 
     g_guiProcessesBySession[sessionId] = { processId, processHandle };
+    DebugLogService(
+        L"TrackGuiProcess: session=%lu pid=%lu tracked",
+        sessionId,
+        processId);
     return true;
 }
 
@@ -424,31 +1911,46 @@ std::wstring BuildGuiCommandLine(const std::wstring& executablePath)
 
 bool LaunchGuiInSession(DWORD sessionId)
 {
+    DebugLogService(L"LaunchGuiInSession: session=%lu start", sessionId);
+
     if (sessionId == 0)
     {
+        DebugLogService(L"LaunchGuiInSession: session=%lu skipped because Session 0 is not interactive", sessionId);
         return false;
     }
 
     if (InterlockedCompareExchange(&g_rpcStopRequested, 0, 0) != 0)
     {
+        DebugLogService(L"LaunchGuiInSession: session=%lu skipped because service stop is requested", sessionId);
         return false;
     }
 
     if (g_guiExecutablePath.empty() || !FileExists(g_guiExecutablePath))
     {
+        DebugLogService(
+            L"LaunchGuiInSession: session=%lu skipped because GUI path is missing: %ls",
+            sessionId,
+            g_guiExecutablePath.empty() ? L"(empty)" : g_guiExecutablePath.c_str());
         return false;
     }
 
     if (IsGuiRunningInSession(sessionId))
     {
+        DebugLogService(L"LaunchGuiInSession: session=%lu skipped because tracked GUI is alive", sessionId);
         return true;
     }
 
     HANDLE userToken = nullptr;
     if (!WTSQueryUserToken(sessionId, &userToken))
     {
+        const DWORD error = GetLastError();
+        DebugLogService(
+            L"LaunchGuiInSession: session=%lu WTSQueryUserToken failed, error=%lu",
+            sessionId,
+            error);
         return false;
     }
+    DebugLogService(L"LaunchGuiInSession: session=%lu WTSQueryUserToken succeeded", sessionId);
 
     HANDLE primaryToken = nullptr;
     const bool tokenDuplicated = DuplicateTokenEx(
@@ -458,15 +1960,27 @@ bool LaunchGuiInSession(DWORD sessionId)
         SecurityImpersonation,
         TokenPrimary,
         &primaryToken) != FALSE;
+    const DWORD duplicateError = tokenDuplicated ? NO_ERROR : GetLastError();
     CloseHandle(userToken);
 
     if (!tokenDuplicated)
     {
+        DebugLogService(
+            L"LaunchGuiInSession: session=%lu DuplicateTokenEx failed, error=%lu",
+            sessionId,
+            duplicateError);
         return false;
     }
+    DebugLogService(L"LaunchGuiInSession: session=%lu DuplicateTokenEx succeeded", sessionId);
 
     LPVOID environmentBlock = nullptr;
     const bool envCreated = CreateEnvironmentBlock(&environmentBlock, primaryToken, FALSE) != FALSE;
+    const DWORD environmentError = envCreated ? NO_ERROR : GetLastError();
+    DebugLogService(
+        L"LaunchGuiInSession: session=%lu CreateEnvironmentBlock %ls, error=%lu",
+        sessionId,
+        envCreated ? L"succeeded" : L"failed",
+        environmentError);
 
     STARTUPINFOW startupInfo{};
     startupInfo.cb = sizeof(startupInfo);
@@ -493,6 +2007,15 @@ bool LaunchGuiInSession(DWORD sessionId)
         workingDirectory.c_str(),
         &startupInfo,
         &processInfo) != FALSE;
+    const DWORD createProcessError = processCreated ? NO_ERROR : GetLastError();
+
+    DebugLogService(
+        L"LaunchGuiInSession: session=%lu CreateProcessAsUserW %ls, error=%lu, pid=%lu, desktop=%ls",
+        sessionId,
+        processCreated ? L"succeeded" : L"failed",
+        createProcessError,
+        processCreated ? processInfo.dwProcessId : 0,
+        startupInfo.lpDesktop);
 
     if (envCreated)
     {
@@ -508,14 +2031,113 @@ bool LaunchGuiInSession(DWORD sessionId)
 
     CloseHandle(processInfo.hThread);
 
-    if (!TrackGuiProcess(sessionId, processInfo.dwProcessId, processInfo.hProcess))
+    antivirus::protection::ProcessProtectionPolicy guiProtectionPolicy{};
+    guiProtectionPolicy.denyBuiltinAdministratorsTerminate = kDenyAdministratorsProcessTerminate;
+    if (!antivirus::protection::HardenProcessHandle(
+        processInfo.hProcess,
+        processInfo.dwProcessId,
+        guiProtectionPolicy))
     {
+        DebugLogServiceProtection(L"GUI process hardening failed; terminating only the GUI process");
         TerminateProcess(processInfo.hProcess, 0);
         WaitForSingleObject(processInfo.hProcess, 5000);
         CloseHandle(processInfo.hProcess);
+        return false;
     }
 
+    if (!TrackGuiProcess(sessionId, processInfo.dwProcessId, processInfo.hProcess))
+    {
+        DebugLogService(
+            L"LaunchGuiInSession: session=%lu pid=%lu terminating duplicate GUI created during race",
+            sessionId,
+            processInfo.dwProcessId);
+        TerminateProcess(processInfo.hProcess, 0);
+        WaitForSingleObject(processInfo.hProcess, 5000);
+        CloseHandle(processInfo.hProcess);
+        return true;
+    }
+
+    DebugLogService(
+        L"LaunchGuiInSession: session=%lu end, launched pid=%lu",
+        sessionId,
+        processInfo.dwProcessId);
     return true;
+}
+
+bool EnsureTrayAppForSession(DWORD sessionId)
+{
+    DebugLogService(L"EnsureTrayAppForSession: session=%lu start", sessionId);
+
+    if (sessionId == 0)
+    {
+        DebugLogService(L"EnsureTrayAppForSession: session=%lu skipped because Session 0 is not interactive", sessionId);
+        return false;
+    }
+
+    WTS_CONNECTSTATE_CLASS sessionState = WTSDown;
+    if (!QuerySessionState(sessionId, sessionState))
+    {
+        DebugLogService(L"EnsureTrayAppForSession: session=%lu end, session state unavailable", sessionId);
+        return false;
+    }
+
+    if (!IsInteractiveSessionState(sessionState))
+    {
+        DebugLogService(
+            L"EnsureTrayAppForSession: session=%lu skipped because state=%ls is not interactive",
+            sessionId,
+            SessionStateName(sessionState));
+        return false;
+    }
+
+    if (IsGuiRunningInSession(sessionId))
+    {
+        DebugLogService(L"EnsureTrayAppForSession: session=%lu end, GUI already alive", sessionId);
+        return true;
+    }
+
+    const bool launched = LaunchGuiInSession(sessionId);
+    DebugLogService(
+        L"EnsureTrayAppForSession: session=%lu end, launched=%ls",
+        sessionId,
+        launched ? L"true" : L"false");
+    return launched;
+}
+
+void OnSessionLogoff(DWORD sessionId)
+{
+    DebugLogService(L"OnSessionLogoff: session=%lu start", sessionId);
+
+    std::lock_guard<std::mutex> guard(g_guiProcessesMutex);
+    auto it = g_guiProcessesBySession.find(sessionId);
+    if (it == g_guiProcessesBySession.end())
+    {
+        DebugLogService(L"OnSessionLogoff: session=%lu no tracked GUI process to clean up", sessionId);
+        return;
+    }
+
+    const DWORD processId = it->second.processId;
+    if (it->second.processHandle != nullptr)
+    {
+        const DWORD waitResult = WaitForSingleObject(it->second.processHandle, 0);
+        DebugLogService(
+            L"OnSessionLogoff: session=%lu pid=%lu cleanup, old process %ls, wait=%lu",
+            sessionId,
+            processId,
+            waitResult == WAIT_TIMEOUT ? L"alive" : L"dead/signaled",
+            waitResult);
+        CloseHandle(it->second.processHandle);
+    }
+    else
+    {
+        DebugLogService(
+            L"OnSessionLogoff: session=%lu pid=%lu cleanup had null process handle",
+            sessionId,
+            processId);
+    }
+
+    g_guiProcessesBySession.erase(it);
+    DebugLogService(L"OnSessionLogoff: session=%lu end, tracking removed", sessionId);
 }
 
 void LaunchGuiInAllUserSessions()
@@ -525,21 +2147,77 @@ void LaunchGuiInAllUserSessions()
 
     if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &sessionCount))
     {
+        const DWORD error = GetLastError();
+        DebugLogService(
+            L"LaunchGuiInAllUserSessions: WTSEnumerateSessionsW failed, error=%lu",
+            error);
         return;
     }
+
+    DebugLogService(
+        L"LaunchGuiInAllUserSessions: scanning %lu sessions",
+        sessionCount);
 
     for (DWORD i = 0; i < sessionCount; ++i)
     {
         const DWORD sessionId = sessions[i].SessionId;
         if (sessionId == 0)
         {
+            DebugLogService(L"LaunchGuiInAllUserSessions: session=0 skipped");
             continue;
         }
 
-        LaunchGuiInSession(sessionId);
+        if (!IsInteractiveSessionState(sessions[i].State))
+        {
+            DebugLogService(
+                L"LaunchGuiInAllUserSessions: session=%lu skipped because state=%ls",
+                sessionId,
+                SessionStateName(sessions[i].State));
+            continue;
+        }
+
+        EnsureTrayAppForSession(sessionId);
     }
 
     WTSFreeMemory(sessions);
+}
+
+void GuiSessionMonitorLoop()
+{
+    DebugLogService(L"GuiSessionMonitorLoop: started");
+
+    while (!g_guiSessionMonitorStopRequested.load())
+    {
+        LaunchGuiInAllUserSessions();
+
+        DWORD sleptMs = 0;
+        while (sleptMs < kGuiSessionMonitorIntervalMs
+            && !g_guiSessionMonitorStopRequested.load())
+        {
+            const DWORD sleepMs = std::min<DWORD>(
+                kServiceStatusPollIntervalMs,
+                kGuiSessionMonitorIntervalMs - sleptMs);
+            Sleep(sleepMs);
+            sleptMs += sleepMs;
+        }
+    }
+
+    DebugLogService(L"GuiSessionMonitorLoop: stopped");
+}
+
+void StartGuiSessionMonitor()
+{
+    g_guiSessionMonitorStopRequested.store(false);
+    g_guiSessionMonitorThread = std::thread(GuiSessionMonitorLoop);
+}
+
+void StopGuiSessionMonitor()
+{
+    g_guiSessionMonitorStopRequested.store(true);
+    if (g_guiSessionMonitorThread.joinable())
+    {
+        g_guiSessionMonitorThread.join();
+    }
 }
 
 void StopTrackedGuiProcesses()
@@ -614,16 +2292,46 @@ DWORD WINAPI ServiceControlHandlerEx(
     {
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
-        return ERROR_CALL_NOT_IMPLEMENTED;
+        RequestConfirmedServiceStop();
+        return NO_ERROR;
     case SERVICE_CONTROL_INTERROGATE:
         ReportServiceStatus(g_serviceStatus.dwCurrentState, g_serviceStatus.dwWin32ExitCode, 0);
         return NO_ERROR;
     case SERVICE_CONTROL_SESSIONCHANGE:
     {
-        if (eventType == WTS_SESSION_LOGON && eventData != nullptr)
+        DWORD sessionId = 0;
+        if (eventData != nullptr)
         {
             const auto* notification = static_cast<WTSSESSION_NOTIFICATION*>(eventData);
-            LaunchGuiInSession(notification->dwSessionId);
+            sessionId = notification->dwSessionId;
+        }
+
+        DebugLogService(
+            L"ServiceControlHandlerEx: session change event=%ls(%lu), session=%lu",
+            SessionChangeEventName(eventType),
+            eventType,
+            sessionId);
+
+        if (eventData == nullptr)
+        {
+            DebugLogService(L"ServiceControlHandlerEx: session change skipped because eventData is null");
+            return NO_ERROR;
+        }
+
+        switch (eventType)
+        {
+        case WTS_SESSION_LOGON:
+        case WTS_SESSION_UNLOCK:
+        case WTS_CONSOLE_CONNECT:
+        case WTS_REMOTE_CONNECT:
+            EnsureTrayAppForSession(sessionId);
+            break;
+        case WTS_SESSION_LOGOFF:
+        case WTS_SESSION_TERMINATE:
+            OnSessionLogoff(sessionId);
+            break;
+        default:
+            break;
         }
 
         return NO_ERROR;
@@ -648,10 +2356,14 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
     }
 
     ReportServiceStatus(SERVICE_START_PENDING, NO_ERROR, 5000);
+    InitializeAntivirusEngineLayer();
+    InitializeWebApiLayer();
 
     g_guiExecutablePath = ResolveGuiExecutablePath();
     if (g_guiExecutablePath.empty() || !FileExists(g_guiExecutablePath))
     {
+        ShutdownWebApiLayer();
+        ShutdownAntivirusEngineLayer();
         ReportServiceStatus(SERVICE_STOPPED, ERROR_FILE_NOT_FOUND, 0);
         return;
     }
@@ -659,34 +2371,533 @@ void WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
     const DWORD rpcStartError = StartRpcServer();
     if (rpcStartError != NO_ERROR)
     {
+        ShutdownWebApiLayer();
+        ShutdownAntivirusEngineLayer();
         ReportServiceStatus(SERVICE_STOPPED, rpcStartError, 0);
         return;
     }
 
     ReportServiceStatus(SERVICE_RUNNING, NO_ERROR, 0);
+    HardenRunningServiceObjects();
+    StartAntivirusWorker();
+    StartDirectoryMonitors();
     LaunchGuiInAllUserSessions();
+    StartGuiSessionMonitor();
 
     RPC_STATUS waitStatus = RpcMgmtWaitServerListen();
     if (waitStatus != RPC_S_OK && waitStatus != RPC_S_NOT_LISTENING)
     {
+        StopDirectoryMonitors();
+        StopAntivirusWorker();
+        StopGuiSessionMonitor();
+        ShutdownWebApiLayer();
+        ShutdownAntivirusEngineLayer();
         ReportServiceStatus(SERVICE_STOPPED, RpcStatusToWin32(waitStatus), 0);
         return;
     }
 
+    StopDirectoryMonitors();
+    StopAntivirusWorker();
+    StopGuiSessionMonitor();
     StopTrackedGuiProcesses();
+    ShutdownWebApiLayer();
+    ShutdownAntivirusEngineLayer();
     RpcServerUnregisterIf(AntivirusRpcControl_v1_0_s_ifspec, nullptr, FALSE);
     ReportServiceStatus(SERVICE_STOPPED, NO_ERROR, 0);
 }
 } // namespace
 
-extern "C" void StopService(void)
+// Запрашивает штатную остановку RPC listener и service main loop.
+void RequestConfirmedServiceStop()
 {
     if (InterlockedExchange(&g_rpcStopRequested, 1) != 0)
     {
         return;
     }
 
+    ReportServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
     RpcMgmtStopServerListening(nullptr);
+}
+
+extern "C" void StopService(void)
+{
+    DebugLogServiceProtection(L"legacy StopService RPC ignored; use ConfirmStop after GUI confirmation");
+}
+
+// Останавливает службу после подтверждения в пользовательской GUI session.
+extern "C" void ConfirmStop(void)
+{
+    RequestConfirmedServiceStop();
+}
+
+// Returns safe information about the current authenticated user.
+extern "C" RpcResultCode GetCurrentAuthInfo(RpcAuthInfo* authInfo)
+{
+    if (authInfo == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    FillRpcAuthInfo(authInfo);
+    return RPC_RESULT_OK;
+}
+
+// Performs login and stores JWT tokens only in service memory.
+extern "C" RpcResultCode LoginUser(
+    const wchar_t* username,
+    const wchar_t* password,
+    RpcAuthInfo* authInfo)
+{
+    if (authInfo == nullptr || username == nullptr || password == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    if (*username == L'\0' || *password == L'\0')
+    {
+        FillRpcAuthInfo(authInfo);
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    const std::string usernameUtf8 = ToUtf8(username);
+    const std::string passwordUtf8 = ToUtf8(password);
+    if (usernameUtf8.empty() || passwordUtf8.empty())
+    {
+        FillRpcAuthInfo(authInfo);
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    antivirus::web::AuthTokens tokens;
+    antivirus::web::AuthError loginError;
+    if (!g_webApiClient.Login(usernameUtf8, passwordUtf8, &tokens, &loginError))
+    {
+        ClearAuthAndLicenseState();
+        FillRpcAuthInfo(authInfo);
+        return MapAuthErrorToRpcCode(loginError);
+    }
+
+    g_webSession.SetAuthTokens(std::move(tokens));
+    {
+        std::lock_guard<std::mutex> guard(g_webStateMutex);
+        g_authenticatedUsername = usernameUtf8;
+    }
+
+    antivirus::web::AuthUserInfo userInfo;
+    antivirus::web::AuthError userError;
+    const antivirus::web::AuthTokens currentTokens = g_webSession.GetAuthTokens();
+    if (g_webApiClient.GetCurrentUser(currentTokens.accessToken, &userInfo, &userError))
+    {
+        g_webSession.SetAuthUserInfo(userInfo);
+    }
+
+    FillRpcAuthInfo(authInfo);
+    return RPC_RESULT_OK;
+}
+
+// Performs logout and clears auth/license state from memory.
+extern "C" RpcResultCode LogoutUser(RpcAuthInfo* authInfo, RpcLicenseInfo* licenseInfo)
+{
+    ClearAuthAndLicenseState();
+
+    if (authInfo != nullptr)
+    {
+        FillRpcAuthInfo(authInfo);
+    }
+
+    if (licenseInfo != nullptr)
+    {
+        FillRpcLicenseInfo(licenseInfo, RPC_RESULT_NO_LICENSE, "NO_LICENSE");
+    }
+
+    return RPC_RESULT_OK;
+}
+
+// Requests current license status and stores ticket only in memory.
+extern "C" RpcResultCode GetActiveLicenseInfo(
+    hyper productId,
+    const wchar_t* deviceMac,
+    RpcLicenseInfo* licenseInfo)
+{
+    if (licenseInfo == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    if (!g_webSession.HasAuthTokens())
+    {
+        FillRpcLicenseInfo(licenseInfo, RPC_RESULT_NOT_AUTHENTICATED, "NOT_AUTHENTICATED");
+        return RPC_RESULT_NOT_AUTHENTICATED;
+    }
+
+    const std::string deviceMacUtf8 = ToUtf8(deviceMac);
+    if (productId <= 0 || deviceMacUtf8.empty())
+    {
+        FillRpcLicenseInfo(licenseInfo, RPC_RESULT_INVALID_ARGUMENT, "INVALID_ARGUMENT");
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    const antivirus::web::AuthTokens tokens = g_webSession.GetAuthTokens();
+    antivirus::web::LicenseState licenseState;
+    antivirus::web::LicenseError licenseError;
+    if (!g_webApiClient.CheckLicense(tokens.accessToken, static_cast<long long>(productId), deviceMacUtf8, &licenseState, &licenseError))
+    {
+        const RpcResultCode errorCode = MapLicenseErrorToRpcCode(licenseError);
+        if (errorCode == RPC_RESULT_NO_LICENSE)
+        {
+            g_webSession.SetLicenseState(antivirus::web::LicenseState{});
+            EnsureValidLicenseForAntivirus();
+        }
+
+        FillRpcLicenseInfo(licenseInfo, errorCode, licenseError.message);
+        return errorCode;
+    }
+
+    g_webSession.SetLicenseState(std::move(licenseState));
+    {
+        std::lock_guard<std::mutex> guard(g_webStateMutex);
+        g_licenseRequestContext.hasContext = true;
+        g_licenseRequestContext.productId = static_cast<long long>(productId);
+        g_licenseRequestContext.deviceMac = deviceMacUtf8;
+    }
+
+    const RpcResultCode licenseCode = EnsureValidLicenseForAntivirus();
+    if (licenseCode == RPC_RESULT_OK)
+    {
+        bool needsInitialization = false;
+        {
+            std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+            needsInitialization = !g_avDatabaseLoaded;
+        }
+
+        if (needsInitialization)
+        {
+            InitializeAntivirusEngineLayer();
+        }
+
+        if (g_forceDatabaseUpdateRequested.load())
+        {
+            RunScheduledDatabaseUpdate(true);
+        }
+
+        std::vector<std::array<uint8_t, 16>> repairIds;
+        {
+            std::lock_guard<std::mutex> guard(g_avMaintenanceMutex);
+            repairIds = g_pendingDatabaseRepairIds;
+            g_pendingDatabaseRepairIds.clear();
+        }
+        if (!repairIds.empty())
+        {
+            RepairSkippedDatabaseRecords(repairIds);
+        }
+    }
+
+    FillRpcLicenseInfo(licenseInfo, licenseCode, LicenseCodeToText(licenseCode));
+    return licenseCode;
+}
+
+// Activates product and updates in-memory license state.
+extern "C" RpcResultCode ActivateProduct(
+    const wchar_t* activationKey,
+    const wchar_t* deviceName,
+    const wchar_t* deviceMac,
+    hyper productId,
+    RpcLicenseInfo* licenseInfo)
+{
+    if (licenseInfo == nullptr || activationKey == nullptr || deviceName == nullptr || deviceMac == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    if (!g_webSession.HasAuthTokens())
+    {
+        FillRpcLicenseInfo(licenseInfo, RPC_RESULT_NOT_AUTHENTICATED, "NOT_AUTHENTICATED");
+        return RPC_RESULT_NOT_AUTHENTICATED;
+    }
+
+    const std::string activationKeyUtf8 = ToUtf8(activationKey);
+    const std::string deviceNameUtf8 = ToUtf8(deviceName);
+    const std::string deviceMacUtf8 = ToUtf8(deviceMac);
+    if (activationKeyUtf8.empty() || deviceNameUtf8.empty() || deviceMacUtf8.empty())
+    {
+        FillRpcLicenseInfo(licenseInfo, RPC_RESULT_INVALID_ARGUMENT, "INVALID_ARGUMENT");
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    const antivirus::web::AuthTokens tokens = g_webSession.GetAuthTokens();
+    antivirus::web::LicenseState licenseState;
+    antivirus::web::LicenseError activateError;
+    if (!g_webApiClient.ActivateLicense(
+        tokens.accessToken,
+        activationKeyUtf8,
+        deviceNameUtf8,
+        deviceMacUtf8,
+        &licenseState,
+        &activateError))
+    {
+        const RpcResultCode errorCode = MapLicenseErrorToRpcCode(activateError);
+        FillRpcLicenseInfo(licenseInfo, errorCode, activateError.message);
+        return errorCode;
+    }
+
+    if (!licenseState.hasLicense)
+    {
+        if (productId <= 0)
+        {
+            g_webSession.SetLicenseState(antivirus::web::LicenseState{});
+            EnsureValidLicenseForAntivirus();
+            FillRpcLicenseInfo(licenseInfo, RPC_RESULT_NO_LICENSE, "NO_LICENSE");
+            return RPC_RESULT_NO_LICENSE;
+        }
+
+        antivirus::web::LicenseError checkError;
+        if (!g_webApiClient.CheckLicense(
+            tokens.accessToken,
+            static_cast<long long>(productId),
+            deviceMacUtf8,
+            &licenseState,
+            &checkError))
+        {
+            const RpcResultCode errorCode = MapLicenseErrorToRpcCode(checkError);
+            FillRpcLicenseInfo(licenseInfo, errorCode, checkError.message);
+            return errorCode;
+        }
+    }
+
+    g_webSession.SetLicenseState(std::move(licenseState));
+    {
+        std::lock_guard<std::mutex> guard(g_webStateMutex);
+        g_licenseRequestContext.hasContext = true;
+        g_licenseRequestContext.productId = static_cast<long long>(productId);
+        g_licenseRequestContext.deviceMac = deviceMacUtf8;
+    }
+
+    const RpcResultCode licenseCode = EnsureValidLicenseForAntivirus();
+    if (licenseCode == RPC_RESULT_OK && g_forceDatabaseUpdateRequested.load())
+    {
+        RunScheduledDatabaseUpdate(true);
+    }
+    if (licenseCode == RPC_RESULT_OK)
+    {
+        std::vector<std::array<uint8_t, 16>> repairIds;
+        {
+            std::lock_guard<std::mutex> guard(g_avMaintenanceMutex);
+            repairIds = g_pendingDatabaseRepairIds;
+            g_pendingDatabaseRepairIds.clear();
+        }
+        if (!repairIds.empty())
+        {
+            RepairSkippedDatabaseRecords(repairIds);
+        }
+    }
+    FillRpcLicenseInfo(licenseInfo, licenseCode, LicenseCodeToText(licenseCode));
+    return licenseCode;
+}
+
+// Scans one selected file through the in-memory antivirus engine.
+extern "C" RpcResultCode ScanFile(
+    const wchar_t* path,
+    RpcScanFileResult* scanResult)
+{
+    if (scanResult == nullptr || path == nullptr || *path == L'\0')
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    *scanResult = RpcScanFileResult{};
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        FillRpcScanErrorResult(path, "Antivirus database is not loaded", scanResult);
+        return RPC_RESULT_OK;
+    }
+
+    const antivirus::service::FileScanResult result =
+        antivirus::service::ScanFilePath(std::filesystem::path(path), databaseSnapshot);
+    FillRpcScanFileResult(result, scanResult);
+    return RPC_RESULT_OK;
+}
+
+// Scans files in a selected directory recursively through the antivirus engine.
+extern "C" RpcResultCode ScanDirectory(
+    const wchar_t* path,
+    RpcScanDirectoryResult* scanResult)
+{
+    if (scanResult == nullptr || path == nullptr || *path == L'\0')
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    *scanResult = RpcScanDirectoryResult{};
+
+    antivirus::service::DirectoryScanResult result;
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        antivirus::service::FileScanResult fileResult;
+        fileResult.status = antivirus::service::FileScanStatus::Error;
+        fileResult.path = std::filesystem::path(path);
+        fileResult.objectType = antivirus::engine::AvObjectType::Unknown;
+        fileResult.message = "Antivirus database is not loaded";
+        result.totalScanned = 1;
+        result.errorCount = 1;
+        result.results.push_back(std::move(fileResult));
+    }
+    else
+    {
+        result = antivirus::service::ScanDirectoryPath(std::filesystem::path(path), databaseSnapshot);
+    }
+
+    return FillRpcScanDirectoryResult(result, scanResult)
+        ? RPC_RESULT_OK
+        : RPC_RESULT_INTERNAL_ERROR;
+}
+
+// Returns current in-memory antivirus database release date and record count.
+extern "C" RpcResultCode GetAvDatabaseInfo(RpcAvDatabaseInfo* databaseInfo)
+{
+    if (databaseInfo == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    *databaseInfo = RpcAvDatabaseInfo{};
+    std::lock_guard<std::mutex> guard(g_avDatabaseMutex);
+    bool schedulerEnabled = false;
+    std::string schedulerStatus;
+    {
+        std::lock_guard<std::mutex> schedulerGuard(g_schedulerMutex);
+        schedulerEnabled = g_scheduledScanState.enabled;
+        schedulerStatus = g_scheduledScanState.lastStatus;
+        if (g_scheduledScanState.running)
+        {
+            schedulerStatus = "running";
+        }
+    }
+
+    bool monitoringEnabled = false;
+    std::string monitoringStatus;
+    {
+        std::lock_guard<std::mutex> monitoringGuard(g_monitoringMutex);
+        monitoringEnabled = g_monitoringState.enabled;
+        monitoringStatus = g_monitoringState.lastStatus;
+    }
+
+    const antivirus::service::AvDatabaseRuntimeInfo info =
+        antivirus::service::GetDatabaseRuntimeInfo(
+            g_avSignatureDatabase,
+            g_avDatabaseLoaded,
+            g_avDatabaseSourceName,
+            g_avLastUpdateStatus,
+            g_avLastSuccessfulLoadUtc,
+            g_avLastSuccessfulManifestVerificationUtc,
+            g_avSkippedRecordCount,
+            g_avVerifierName,
+            schedulerEnabled,
+            monitoringEnabled,
+            schedulerStatus,
+            monitoringStatus);
+    FillRpcAvDatabaseInfo(info, databaseInfo);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode ScanFixedDrives(RpcScanDirectoryResult* scanResult)
+{
+    if (scanResult == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    *scanResult = RpcScanDirectoryResult{};
+
+    antivirus::engine::AvSignatureDatabase databaseSnapshot;
+    if (!SnapshotAntivirusDatabase(&databaseSnapshot))
+    {
+        antivirus::service::DirectoryScanResult result;
+        antivirus::service::FileScanResult fileResult;
+        fileResult.status = antivirus::service::FileScanStatus::Error;
+        fileResult.message = "Antivirus database is not loaded";
+        result.totalScanned = 1;
+        result.errorCount = 1;
+        result.results.push_back(std::move(fileResult));
+        return FillRpcScanDirectoryResult(result, scanResult)
+            ? RPC_RESULT_OK
+            : RPC_RESULT_INTERNAL_ERROR;
+    }
+
+    const antivirus::service::DirectoryScanResult result =
+        antivirus::service::ScanFixedDrives(databaseSnapshot);
+    return FillRpcScanDirectoryResult(result, scanResult)
+        ? RPC_RESULT_OK
+        : RPC_RESULT_INTERNAL_ERROR;
+}
+
+extern "C" RpcResultCode GetSchedulerStatus(RpcSchedulerStatus* schedulerStatus)
+{
+    if (schedulerStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    FillRpcSchedulerStatus(schedulerStatus);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode SetSchedulerEnabled(long enabled, RpcSchedulerStatus* schedulerStatus)
+{
+    if (schedulerStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(g_schedulerMutex);
+        g_scheduledScanState.enabled = enabled != 0;
+        g_scheduledScanState.lastStatus = g_scheduledScanState.enabled ? "enabled" : "disabled";
+    }
+    FillRpcSchedulerStatus(schedulerStatus);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode GetMonitoringStatus(RpcMonitoringStatus* monitoringStatus)
+{
+    if (monitoringStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    EnsureMonitoringStateInitialized();
+    FillRpcMonitoringStatus(monitoringStatus);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode GetMonitoredDirectories(RpcMonitoringStatus* monitoringStatus)
+{
+    return GetMonitoringStatus(monitoringStatus);
+}
+
+extern "C" RpcResultCode AddMonitoredDirectory(const wchar_t* path, RpcMonitoringStatus* monitoringStatus)
+{
+    if (path == nullptr || *path == L'\0' || monitoringStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    AddMonitoredDirectoryPath(std::filesystem::path(path));
+    FillRpcMonitoringStatus(monitoringStatus);
+    return RPC_RESULT_OK;
+}
+
+extern "C" RpcResultCode RemoveMonitoredDirectory(const wchar_t* path, RpcMonitoringStatus* monitoringStatus)
+{
+    if (path == nullptr || *path == L'\0' || monitoringStatus == nullptr)
+    {
+        return RPC_RESULT_INVALID_ARGUMENT;
+    }
+
+    RemoveMonitoredDirectoryPath(std::filesystem::path(path));
+    FillRpcMonitoringStatus(monitoringStatus);
+    return RPC_RESULT_OK;
 }
 
 extern "C" void* __RPC_USER MIDL_user_allocate(size_t size)
@@ -699,8 +2910,29 @@ extern "C" void __RPC_USER MIDL_user_free(void* pointer)
     std::free(pointer);
 }
 
-int wmain()
+// Checks whether the process should run the AV engine self-test instead of SCM mode.
+bool IsAntivirusEngineSelfTestArgumentPresent(int argc, wchar_t** argv)
 {
+    for (int i = 1; i < argc; ++i)
+    {
+        if (argv[i] != nullptr
+            && (std::wcscmp(argv[i], L"--av-self-test") == 0
+                || std::wcscmp(argv[i], L"/av-self-test") == 0))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+    if (IsAntivirusEngineSelfTestArgumentPresent(argc, argv))
+    {
+        return antivirus::service::RunAntivirusEngineSelfTest();
+    }
+
     SERVICE_TABLE_ENTRYW dispatchTable[] = {
         { const_cast<LPWSTR>(antivirus::common::kServiceName), ServiceMain },
         { nullptr, nullptr },

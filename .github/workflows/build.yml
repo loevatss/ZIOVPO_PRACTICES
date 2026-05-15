@@ -8,39 +8,134 @@ jobs:
   build:
     runs-on: windows-latest
 
+    env:
+      BUILD_CONFIGURATION: Release
+      BUILD_PLATFORM: x64
+      INSTALLER_VERSION: 1.0.${{ github.run_number }}
+      WIX_VERSION: 5.0.2
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure CMake (VS2022, v143, x64)
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -T v143
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
 
-      - name: Build Release
-        run: cmake --build build --config Release
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
 
-      - name: Collect executables
+      - name: Install WiX Toolset
         shell: pwsh
         run: |
-          $antivirusExe = "build/Release/Antivirus.exe"
-          $serviceExe = "build/Release/AntivirusService.exe"
+          dotnet tool install --global wix --version ${env:WIX_VERSION}
 
-          if (-not (Test-Path $antivirusExe)) {
-            throw "Antivirus.exe was not found at $antivirusExe"
+          $wixToolDir = Join-Path $env:USERPROFILE '.dotnet\tools'
+          $env:PATH = "$wixToolDir;$env:PATH"
+          $wixToolDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          & (Join-Path $wixToolDir 'wix.exe') --version
+
+      - name: Build native Release x64
+        shell: pwsh
+        run: |
+          msbuild.exe Antivirus.slnx `
+            /restore `
+            /t:Build `
+            /p:Configuration=${env:BUILD_CONFIGURATION} `
+            /p:Platform=${env:BUILD_PLATFORM}
+
+      - name: Run TrayService self-test
+        shell: pwsh
+        run: |
+          .\x64\Release\TrayService.exe --av-self-test
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          msbuild.exe Installer\TrayInstaller.wixproj `
+            /restore `
+            /t:Build `
+            /p:Configuration=${env:BUILD_CONFIGURATION} `
+            /p:Platform=${env:BUILD_PLATFORM} `
+            /p:InstallerVersion=${env:INSTALLER_VERSION}
+
+      - name: Build bundle
+        shell: pwsh
+        run: |
+          msbuild.exe Installer\TrayBundle.wixproj `
+            /restore `
+            /t:Build `
+            /p:Configuration=${env:BUILD_CONFIGURATION} `
+            /p:Platform=${env:BUILD_PLATFORM} `
+            /p:InstallerVersion=${env:INSTALLER_VERSION}
+
+      - name: Validate outputs and prepare artifacts
+        shell: pwsh
+        run: |
+          $rawAppArtifactDir = Join-Path $PWD 'ci-artifacts\app'
+          $installerArtifactDir = Join-Path $PWD 'ci-artifacts\installer'
+
+          Remove-Item -LiteralPath $rawAppArtifactDir -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $installerArtifactDir -Recurse -Force -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Path $rawAppArtifactDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $installerArtifactDir -Force | Out-Null
+
+          $trayApp = 'x64/Release/TrayApp.exe'
+          $trayService = 'x64/Release/TrayService.exe'
+          $msi = 'Installer/bin/Release/x64/ZIOVPOAntivirus.msi'
+          $bundle = 'Installer/bin/Release/x64/ZIOVPOAntivirusSetup.exe'
+          $stagedTrayService = 'Installer/artifacts/staging/app/TrayService.exe'
+
+          foreach ($path in @($trayApp, $trayService, $msi, $bundle, $stagedTrayService)) {
+            if (-not (Test-Path $path -PathType Leaf)) {
+              throw "Required build output was not found: $path"
+            }
           }
-          if (-not (Test-Path $serviceExe)) {
-            throw "AntivirusService.exe was not found at $serviceExe"
+
+          $builtHash = (Get-FileHash $trayService -Algorithm SHA256).Hash
+          $stagedHash = (Get-FileHash $stagedTrayService -Algorithm SHA256).Hash
+
+          if ($builtHash -ne $stagedHash) {
+            throw "Installer staging does not contain the fresh TrayService.exe. Built=$builtHash Staged=$stagedHash"
           }
 
-          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
-          Copy-Item -Path $antivirusExe -Destination artifacts/Antivirus.exe -Force
-          Copy-Item -Path $serviceExe -Destination artifacts/AntivirusService.exe -Force
+          Copy-Item $trayApp $rawAppArtifactDir -Force
+          Copy-Item $trayService $rawAppArtifactDir -Force
+          Copy-Item $msi $installerArtifactDir -Force
+          Copy-Item $bundle $installerArtifactDir -Force
+          Copy-Item 'Installer/README.md' (Join-Path $installerArtifactDir 'README.md') -Force
 
-          Write-Host "Antivirus: $antivirusExe"
-          Write-Host "AntivirusService: $serviceExe"
+          $installerFiles = Get-ChildItem $installerArtifactDir -File
+          $expectedInstallerFiles = @(
+            'README.md',
+            'ZIOVPOAntivirus.msi',
+            'ZIOVPOAntivirusSetup.exe'
+          ) | Sort-Object
 
-      - name: Upload artifacts
+          $actualInstallerFiles = $installerFiles.Name | Sort-Object
+
+          if (@(Compare-Object -ReferenceObject $expectedInstallerFiles -DifferenceObject $actualInstallerFiles).Count -ne 0) {
+            throw "Installer artifact contains unexpected files: $($actualInstallerFiles -join ', ')"
+          }
+
+          Write-Host 'Installer output files:'
+          $installerFiles | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+
+      - name: Upload raw app artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: antivirus-release-x64
-          path: artifacts/*.exe
+          name: ziovpo-antivirus-app-x64
+          path: ci-artifacts/app/*
+          if-no-files-found: error
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ziovpo-antivirus-installer-x64
+          path: ci-artifacts/installer/*
           if-no-files-found: error

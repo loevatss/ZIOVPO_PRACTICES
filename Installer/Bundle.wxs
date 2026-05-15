@@ -1,0 +1,52 @@
+<Wix
+  xmlns="http://wixtoolset.org/schemas/v4/wxs"
+  xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+  xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Bundle
+    Name="ZIOVPO Antivirus Setup"
+    Manufacturer="ZIOVPO"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="{B933A547-4156-4381-84D3-3375E2793590}">
+    <util:RegistrySearch
+      Id="VCRedistX64InstalledSearch"
+      Variable="VCRedistX64Installed"
+      Root="HKLM"
+      Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+      Value="Installed"
+      Result="value"
+      Bitness="always64" />
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+        LicenseUrl=""
+        Theme="hyperlinkLicense" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <ExePackage
+        Id="VCRedistX64"
+        DisplayName="Microsoft Visual C++ Redistributable (x64)"
+        SourceFile="$(var.VCRedistPath)"
+        Compressed="yes"
+        PerMachine="yes"
+        Permanent="no"
+        Vital="yes"
+        DetectCondition="VCRedistX64Installed = 1"
+        InstallArguments="/install /quiet /norestart"
+        RepairArguments="/repair /quiet /norestart"
+        UninstallArguments="/uninstall /quiet /norestart">
+        <ExitCode Value="0" Behavior="success" />
+        <ExitCode Value="1638" Behavior="success" />
+        <ExitCode Value="-2147023194" Behavior="success" />
+        <ExitCode Value="3010" Behavior="scheduleReboot" />
+      </ExePackage>
+
+      <MsiPackage
+        Id="ZIOVPOAntivirusMsi"
+        SourceFile="$(var.MsiPath)"
+        DisplayName="ZIOVPO Antivirus"
+        Compressed="yes"
+        Visible="no" />
+    </Chain>
+  </Bundle>
+</Wix>
